@@ -20,6 +20,210 @@ const pool = new Pool({
 // TTL configurable (minutos). Default 15 si no existe en .env
 const RESERVATION_TTL_MINUTES = Number(process.env.RESERVATION_TTL_MINUTES || 15);
 
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+
+// ===============================
+// 🔐 ADMIN AUTH (simple JWT)
+// ===============================
+function requireEnv(name) {
+  if (!process.env[name]) {
+    console.error(`❌ Falta ${name} en .env / Render env vars`);
+    process.exit(1);
+  }
+}
+
+requireEnv("ADMIN_EMAIL");
+requireEnv("ADMIN_PASSWORD_HASH");
+requireEnv("ADMIN_JWT_SECRET");
+
+function signAdminToken() {
+  // token válido 7 días
+  return jwt.sign(
+    { role: "admin" },
+    process.env.ADMIN_JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+}
+
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ ok: false, error: "Falta token" });
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.ADMIN_JWT_SECRET);
+    if (payload.role !== "admin") {
+      return res.status(403).json({ ok: false, error: "No autorizado" });
+    }
+    next();
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: "Token inválido/expirado" });
+  }
+}
+
+// Login admin
+app.post("/admin/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: "Email y password requeridos" });
+    }
+
+    if (String(email).toLowerCase() !== String(process.env.ADMIN_EMAIL).toLowerCase()) {
+      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    const ok = await bcrypt.compare(String(password), String(process.env.ADMIN_PASSWORD_HASH));
+    if (!ok) {
+      return res.status(401).json({ ok: false, error: "Credenciales inválidas" });
+    }
+
+    const token = signAdminToken();
+    return res.json({ ok: true, token });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Listar variantes (admin)
+app.get("/admin/variants", requireAdmin, async (req, res) => {
+  try {
+    const q = `
+      select
+        id, sku, color, size, grabado_codigo, grabado_nombre,
+        price_clp,
+        stock_total,
+        stock_reserved,
+        (stock_total - stock_reserved) as stock_available,
+        active,
+        created_at
+      from product_variants
+      order by color, grabado_codigo, size;
+    `;
+    const r = await pool.query(q);
+    return res.json({ ok: true, rows: r.rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Editar variante (admin)
+app.patch("/admin/variants/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { price_clp, stock_total, active } = req.body || {};
+
+  // Validación básica
+  if (!id) return res.status(400).json({ ok: false, error: "Falta id" });
+
+  const fields = [];
+  const values = [];
+  let i = 1;
+
+  if (price_clp !== undefined) {
+    const p = Number(price_clp);
+    if (!Number.isFinite(p) || p < 0) {
+      return res.status(400).json({ ok: false, error: "price_clp inválido" });
+    }
+    fields.push(`price_clp = $${i++}`);
+    values.push(p);
+  }
+
+  if (stock_total !== undefined) {
+    const s = Number(stock_total);
+    if (!Number.isFinite(s) || s < 0) {
+      return res.status(400).json({ ok: false, error: "stock_total inválido" });
+    }
+    fields.push(`stock_total = $${i++}`);
+    values.push(s);
+  }
+
+  if (active !== undefined) {
+    const a = Boolean(active);
+    fields.push(`active = $${i++}`);
+    values.push(a);
+  }
+
+  if (fields.length === 0) {
+    return res.status(400).json({ ok: false, error: "Nada para actualizar" });
+  }
+
+  values.push(id);
+
+  try {
+    const q = `
+      update product_variants
+      set ${fields.join(", ")}
+      where id = $${i}
+      returning
+        id, sku, color, size, grabado_codigo, grabado_nombre,
+        price_clp, stock_total, stock_reserved,
+        (stock_total - stock_reserved) as stock_available,
+        active;
+    `;
+    const r = await pool.query(q, values);
+
+    if (r.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "Variante no encontrada" });
+    }
+
+    return res.json({ ok: true, row: r.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ===============================
+// 🔐 ADMIN LOGIN
+// ===============================
+app.post("/admin/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      ok: false,
+      error: "Email y password requeridos",
+    });
+  }
+
+  // 1️⃣ Validar email
+  if (email !== process.env.ADMIN_EMAIL) {
+    return res.status(401).json({
+      ok: false,
+      error: "Credenciales inválidas",
+    });
+  }
+
+  // 2️⃣ Comparar password con bcrypt
+  const valid = await bcrypt.compare(
+    password,
+    process.env.ADMIN_PASSWORD_HASH
+  );
+
+  if (!valid) {
+    return res.status(401).json({
+      ok: false,
+      error: "Credenciales inválidas",
+    });
+  }
+
+  // 3️⃣ Emitir token
+  const token = jwt.sign(
+    { role: "admin" },
+    process.env.ADMIN_JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  return res.json({
+    ok: true,
+    token,
+  });
+});
+
+
 // ===============================
 // 🔓 CLEANUP STOCK VENCIDO (reusable)
 // ===============================
