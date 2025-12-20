@@ -579,6 +579,40 @@ app.post("/mp/create-preference", async (req, res) => {
     });
   }
 
+      // ============================
+    // ✅ CUANDO MP SEA REAL (activar)
+    // ============================
+    /*
+    await client.query("BEGIN");
+
+    // 1) Extraer payment_id desde el webhook (depende del formato exacto)
+    const paymentId = event?.data?.id;
+
+    // 2) Consultar pago a MP y verificar approved
+    const payment = await mercadopago.payment.findById(paymentId);
+    if (payment?.body?.status !== "approved") {
+      await client.query("ROLLBACK");
+      return res.status(200).send("ok");
+    }
+
+    // 3) Sacar reservation_id desde metadata del pago
+    const reservation_id = payment?.body?.metadata?.reservation_id;
+    if (!reservation_id) {
+      await client.query("ROLLBACK");
+      return res.status(200).send("ok");
+    }
+
+    // 4) Confirmar reserva (Opción A)
+    const confirmed = await confirmReservation_holdReserved(client, reservation_id);
+    if (!confirmed) {
+      await client.query("ROLLBACK");
+      return res.status(200).send("ok");
+    }
+
+    await client.query("COMMIT");
+    */
+
+
   // 🟢 MP REAL
   try {
     const r = await pool.query(
@@ -637,12 +671,117 @@ app.post("/mp/create-preference", async (req, res) => {
   }
 });
 
+// ===============================
+// ✅ MP – Confirmación de reserva (helpers)
+// ===============================
+
+// Opción A (segura con tu regla actual):
+// - marca la reserva como confirmed
+// - NO toca stock_total
+// - NO reduce stock_reserved (porque eso "liberaría" stock y permitiría sobreventa)
+// Ideal si luego crearás una tabla orders/ventas para controlar stock vendido.
+async function confirmReservation_holdReserved(client, reservation_id) {
+  const q = `
+    UPDATE stock_reservations
+    SET status = 'confirmed'
+    WHERE id = $1
+      AND status = 'active'
+      AND expires_at > NOW()
+    RETURNING id, variant_id, quantity, expires_at, status;
+  `;
+  const r = await client.query(q, [reservation_id]);
+  return r.rows[0] || null;
+}
+
+// Opción B (stock "clásico"):
+// - marca confirmed
+// - descuenta stock_total (venta definitiva)
+// - reduce stock_reserved (porque ya no es temporal)
+// Esto es lo más correcto si NO tendrás tabla orders aún.
+async function confirmReservation_decrementTotal(client, reservation_id) {
+  const q = `
+    WITH target AS (
+      SELECT id, variant_id, quantity
+      FROM stock_reservations
+      WHERE id = $1
+        AND status = 'active'
+        AND expires_at > NOW()
+      FOR UPDATE
+    ),
+    updated_variant AS (
+      UPDATE product_variants pv
+      SET
+        stock_total = GREATEST(pv.stock_total - t.quantity, 0),
+        stock_reserved = GREATEST(pv.stock_reserved - t.quantity, 0)
+      FROM target t
+      WHERE pv.id = t.variant_id
+      RETURNING pv.id, pv.stock_total, pv.stock_reserved
+    )
+    UPDATE stock_reservations sr
+    SET status = 'confirmed'
+    FROM target t
+    WHERE sr.id = t.id
+    RETURNING sr.id, sr.variant_id, sr.quantity, sr.status;
+  `;
+  const r = await client.query(q, [reservation_id]);
+  return r.rows[0] || null;
+}
+
 
 app.post("/mp/webhook", async (req, res) => {
-  // STUB: cuando MP esté real, validar firma + confirmar compra
-  console.log("MP webhook (stub):", req.body);
-  res.status(200).send("ok");
+  const client = await pool.connect();
+  try {
+    const event = req.body;
+
+    // 🔒 Cuando MP esté real:
+    // - validar firma usando MP_WEBHOOK_SECRET
+    // - consultar payment_id a MP
+    // - verificar status === "approved"
+
+    console.log("MP webhook recibido:", event);
+    // ============================
+    // ✅ CUANDO MP SEA REAL (activar):
+    // ============================
+    // 1) Extraer payment_id desde el webhook
+    // 2) Consultar pago a MP (SDK) y verificar status === "approved"
+    // 3) Leer reservation_id desde metadata
+    // 4) Confirmar reserva en DB
+
+    /*
+    await client.query("BEGIN");
+
+    // EJEMPLO (placeholder):
+    // const paymentId = event?.data?.id;
+    // const payment = await mercadopago.payment.findById(paymentId);
+    // if (payment.body.status !== "approved") { await client.query("ROLLBACK"); return res.status(200).send("ok"); }
+    // const reservation_id = payment.body.metadata?.reservation_id;
+
+    // Opción A: segura con tu regla actual
+    const confirmed = await confirmReservation_holdReserved(client, reservation_id);
+
+    // Opción B: clásica (descuenta stock_total)
+    // const confirmed = await confirmReservation_decrementTotal(client, reservation_id);
+
+    if (!confirmed) {
+      await client.query("ROLLBACK");
+      return res.status(200).send("ok");
+    }
+
+    await client.query("COMMIT");
+    */
+
+    // 🟡 STUB: no confirmamos nada aún
+    // (cuando MP esté real, aquí confirmaremos la reserva)
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("MP webhook error:", e);
+    return res.status(500).send("error");
+  } finally {
+    client.release();
+  }
 });
+
 
 // ===============================
 // ✅ START
