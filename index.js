@@ -1,0 +1,225 @@
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+require("dotenv").config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+if (!process.env.DATABASE_URL) {
+  console.error("❌ Falta DATABASE_URL en el .env");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Supabase usa SSL
+});
+
+// TTL configurable (minutos). Default 15 si no existe en .env
+const RESERVATION_TTL_MINUTES = Number(process.env.RESERVATION_TTL_MINUTES || 15);
+
+// ===============================
+// 🔓 CLEANUP STOCK VENCIDO (reusable)
+// ===============================
+async function cleanupExpiredReservations(client) {
+  // Limpia reservas vencidas:
+  // - resta quantity desde product_variants.stock_reserved
+  // - marca stock_reservations.status='expired'
+  // NOTA: no toca stock_total
+  const q = `
+    WITH expired AS (
+      SELECT id, variant_id, quantity
+      FROM stock_reservations
+      WHERE status = 'active'
+        AND expires_at <= NOW()
+      FOR UPDATE
+    ),
+    updated_variants AS (
+      UPDATE product_variants pv
+      SET stock_reserved = GREATEST(pv.stock_reserved - e.quantity, 0)
+      FROM expired e
+      WHERE pv.id = e.variant_id
+      RETURNING pv.id
+    )
+    UPDATE stock_reservations sr
+    SET status = 'expired'
+    FROM expired e
+    WHERE sr.id = e.id
+    RETURNING sr.id, sr.variant_id, sr.quantity;
+  `;
+
+  const r = await client.query(q);
+  return { expired_count: r.rowCount, expired: r.rows };
+}
+
+app.get("/health", async (req, res) => {
+  try {
+    const r = await pool.query("select now() as now");
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/variants", async (req, res) => {
+  try {
+    const q = `
+      select
+        id, sku, color, size, grabado_codigo, grabado_nombre,
+        price_clp,
+        (stock_total - stock_reserved) as stock
+      from product_variants
+      where active = true
+      order by color, grabado_codigo, size;
+    `;
+    const r = await pool.query(q);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =====================================
+// (Opcional) Endpoint manual/cron externo
+// =====================================
+app.post("/cleanup-reservations", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const cleaned = await cleanupExpiredReservations(client);
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      ...cleaned,
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/reserve", async (req, res) => {
+  const { variant_id, quantity } = req.body;
+  const qty = Number(quantity);
+
+  if (!variant_id || !Number.isFinite(qty) || qty <= 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "Datos inválidos",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 🔓 0) LIMPIA RESERVAS VENCIDAS ANTES DE CALCULAR STOCK
+    await cleanupExpiredReservations(client);
+
+    // 1) Bloquear fila y leer stock real
+    const stockResult = await client.query(
+      `
+      SELECT id, stock_total, stock_reserved
+      FROM product_variants
+      WHERE id = $1 AND active = true
+      FOR UPDATE
+      `,
+      [variant_id]
+    );
+
+    if (stockResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        ok: false,
+        error: "Variante no encontrada",
+      });
+    }
+
+    const stock_total = Number(stockResult.rows[0].stock_total);
+    const stock_reserved = Number(stockResult.rows[0].stock_reserved);
+    const availableStock = stock_total - stock_reserved;
+
+    // 2) Sin stock
+    if (availableStock <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        reason: "out_of_stock",
+        available: 0,
+        message: "Esta combinación se agotó",
+      });
+    }
+
+    // 3) Stock insuficiente
+    if (availableStock < qty) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        reason: "partial",
+        available: availableStock,
+        message: `Solo quedan ${availableStock} unidades disponibles`,
+      });
+    }
+
+    // 4) Crear reserva con TTL configurable y status active
+    const reservation = await client.query(
+      `
+      INSERT INTO stock_reservations (
+        variant_id,
+        quantity,
+        expires_at,
+        status
+      )
+      VALUES (
+        $1,
+        $2,
+        NOW() + ($3 || ' minutes')::interval,
+        'active'
+      )
+      RETURNING id, expires_at
+      `,
+      [variant_id, qty, RESERVATION_TTL_MINUTES]
+    );
+
+    // 5) Reservar stock (sube stock_reserved)
+    await client.query(
+      `
+      UPDATE product_variants
+      SET stock_reserved = stock_reserved + $1
+      WHERE id = $2
+      `,
+      [qty, variant_id]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      reservation_id: reservation.rows[0].id,
+      expires_at: reservation.rows[0].expires_at,
+      reserved: qty,
+      available_after: availableStock - qty,
+      message: "Stock reservado correctamente",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Error interno",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log("✅ API running on http://localhost:" + PORT)
+);
