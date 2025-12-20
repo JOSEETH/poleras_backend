@@ -25,6 +25,19 @@ requireEnv("ADMIN_EMAIL");
 requireEnv("ADMIN_PASSWORD_HASH");
 requireEnv("ADMIN_JWT_SECRET");
 
+const mercadopago = require("mercadopago");
+
+// Configuración MP (solo se usa si el token es real)
+if (
+  process.env.MP_ACCESS_TOKEN &&
+  process.env.MP_ACCESS_TOKEN !== "PENDIENTE_CLIENTE"
+) {
+  mercadopago.configure({
+    access_token: process.env.MP_ACCESS_TOKEN,
+  });
+}
+
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }, // Supabase usa SSL
@@ -552,15 +565,78 @@ app.post("/mp/create-preference", async (req, res) => {
     return res.status(400).json({ ok: false, error: "missing_reservation_id" });
   }
 
-  // STUB: cuando tengas credenciales, aquí creas la preference real.
-  return res.json({
-    ok: true,
-    stub: true,
-    init_point:
-      "https://example.com/mp-stub?reservation_id=" +
-      encodeURIComponent(reservation_id),
-  });
+  // 🟡 STUB si no hay token real
+  if (
+    !process.env.MP_ACCESS_TOKEN ||
+    process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
+  ) {
+    return res.json({
+      ok: true,
+      stub: true,
+      init_point:
+        "https://example.com/mp-stub?reservation_id=" +
+        encodeURIComponent(reservation_id),
+    });
+  }
+
+  // 🟢 MP REAL
+  try {
+    const r = await pool.query(
+      `
+      SELECT sr.id, sr.quantity, pv.price_clp, pv.sku
+      FROM stock_reservations sr
+      JOIN product_variants pv ON pv.id = sr.variant_id
+      WHERE sr.id = $1 AND sr.status = 'active'
+      `,
+      [reservation_id]
+    );
+
+    if (!r.rowCount) {
+      return res.status(404).json({
+        ok: false,
+        error: "reservation_not_found_or_expired",
+      });
+    }
+
+    const item = r.rows[0];
+
+    const preference = {
+      items: [
+        {
+          id: item.sku,
+          title: "Polera Huillinco",
+          quantity: item.quantity,
+          currency_id: "CLP",
+          unit_price: Number(item.price_clp),
+        },
+      ],
+      metadata: { reservation_id },
+      back_urls: {
+        success: "https://TU-SITIO.cl/success",
+        failure: "https://TU-SITIO.cl/failure",
+        pending: "https://TU-SITIO.cl/pending",
+      },
+      auto_return: "approved",
+      notification_url:
+        "https://poleras-backend.onrender.com/mp/webhook",
+    };
+
+    const mpRes = await mercadopago.preferences.create(preference);
+
+    return res.json({
+      ok: true,
+      init_point: mpRes.body.init_point,
+      mp_preference_id: mpRes.body.id,
+    });
+  } catch (e) {
+    console.error("MP create preference error:", e);
+    return res.status(500).json({
+      ok: false,
+      error: "mp_create_preference_failed",
+    });
+  }
 });
+
 
 app.post("/mp/webhook", async (req, res) => {
   // STUB: cuando MP esté real, validar firma + confirmar compra
