@@ -675,6 +675,7 @@ app.post("/mp/create-preference", async (req, res) => {
           unit_price: Number(item.price_clp),
         },
       ],
+      external_reference: reservation_id,
       metadata: { reservation_id },
       back_urls: {
         success: "https://TU-SITIO.cl/success",
@@ -760,58 +761,100 @@ async function confirmReservation_decrementTotal(client, reservation_id) {
 
 
 app.post("/mp/webhook", async (req, res) => {
-  const client = await pool.connect();
   try {
+    // Responder rápido siempre
+    res.status(200).send("ok");
+
     const event = req.body;
-
-    // 🔒 Cuando MP esté real:
-    // - validar firma usando MP_WEBHOOK_SECRET
-    // - consultar payment_id a MP
-    // - verificar status === "approved"
-
     console.log("MP webhook recibido:", event);
-    // ============================
-    // ✅ CUANDO MP SEA REAL (activar):
-    // ============================
-    // 1) Extraer payment_id desde el webhook
-    // 2) Consultar pago a MP (SDK) y verificar status === "approved"
-    // 3) Leer reservation_id desde metadata
-    // 4) Confirmar reserva en DB
 
-    /*
-    await client.query("BEGIN");
-
-    // EJEMPLO (placeholder):
-    // const paymentId = event?.data?.id;
-    // const payment = await mercadopago.payment.findById(paymentId);
-    // if (payment.body.status !== "approved") { await client.query("ROLLBACK"); return res.status(200).send("ok"); }
-    // const reservation_id = payment.body.metadata?.reservation_id;
-
-    // Opción A: segura con tu regla actual
-    const confirmed = await confirmReservation_holdReserved(client, reservation_id);
-
-    // Opción B: clásica (descuenta stock_total)
-    // const confirmed = await confirmReservation_decrementTotal(client, reservation_id);
-
-    if (!confirmed) {
-      await client.query("ROLLBACK");
-      return res.status(200).send("ok");
+    // Si no hay token real aún, no hacemos nada (stub)
+    if (
+      !process.env.MP_ACCESS_TOKEN ||
+      process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
+    ) {
+      console.log("MP webhook: MP_ACCESS_TOKEN pendiente, ignorando.");
+      return;
     }
 
-    await client.query("COMMIT");
-    */
+    // 1) Extraer payment id desde el webhook
+    const paymentId = event?.data?.id;
+    if (!paymentId) {
+      console.log("MP webhook: no paymentId en event.data.id");
+      return;
+    }
 
-    // 🟡 STUB: no confirmamos nada aún
-    // (cuando MP esté real, aquí confirmaremos la reserva)
+    // 2) Consultar payment real con SDK
+    const payment = await mercadopago.payment.findById(paymentId);
+    const status = payment?.body?.status;
 
-    return res.status(200).send("ok");
+    if (status !== "approved") {
+      console.log("MP webhook: pago no aprobado:", status);
+      return;
+    }
+
+    // 3) Leer reservation_id desde metadata o external_reference
+    const reservation_id =
+      payment?.body?.metadata?.reservation_id ||
+      payment?.body?.external_reference;
+
+    if (!reservation_id) {
+      console.log("MP webhook: falta reservation_id en payment");
+      return;
+    }
+
+    // 4) Confirmar reserva en DB (TU OPCIÓN A)
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const confirmed = await confirmReservation_holdReserved(
+        client,
+        reservation_id
+      );
+
+      if (!confirmed) {
+        await client.query("ROLLBACK");
+        console.log("MP webhook: reserva no confirmada (ya confirmada o expirada)", reservation_id);
+        return;
+      }
+
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("MP webhook: error DB:", e);
+      return;
+    } finally {
+      client.release();
+    }
+
+    // 5) Enviar email a Huillinco (SOLO CON PAGO APROBADO)
+    const to = process.env.STORE_NOTIFY_EMAIL;
+    if (!to) {
+      console.log("MP webhook: falta STORE_NOTIFY_EMAIL");
+      return;
+    }
+
+    await sendStoreNotificationEmail({
+      to,
+      subject: "✅ Pago aprobado — Poleras Huillinco",
+      html: `
+        <div style="font-family:Arial,sans-serif">
+          <h2>✅ Pago aprobado</h2>
+          <p><b>Reserva:</b> ${reservation_id}</p>
+          <p><b>Payment ID:</b> ${paymentId}</p>
+          <p>Ahora corresponde contactar al cliente y coordinar retiro/envío por pagar.</p>
+        </div>
+      `,
+    });
+
+    console.log("MP webhook: confirmado + email enviado", reservation_id);
   } catch (e) {
     console.error("MP webhook error:", e);
-    return res.status(500).send("error");
-  } finally {
-    client.release();
+    // ya respondimos 200 arriba, solo log
   }
 });
+
 
 
 // ===============================
