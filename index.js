@@ -855,7 +855,109 @@ app.post("/mp/webhook", async (req, res) => {
   }
 });
 
+// ===============================
+// ✅ ORDERS (crear orden antes de pagar)
+// ===============================
+app.post("/orders", async (req, res) => {
+  try {
+    const {
+      reservation_id,
+      buyer_name,
+      buyer_email,
+      buyer_phone,
+      delivery_method, // 'retiro' | 'envio_por_pagar'
+      delivery_address, // requerido si envio_por_pagar
+      items, // [{ sku, quantity, unit_price }]
+    } = req.body || {};
 
+    if (!reservation_id) {
+      return res.status(400).json({ ok: false, error: "missing_reservation_id" });
+    }
+    if (!buyer_name) {
+      return res.status(400).json({ ok: false, error: "missing_buyer_name" });
+    }
+    if (!delivery_method || !["retiro", "envio_por_pagar"].includes(delivery_method)) {
+      return res.status(400).json({ ok: false, error: "invalid_delivery_method" });
+    }
+    if (delivery_method === "envio_por_pagar" && !delivery_address) {
+      return res.status(400).json({ ok: false, error: "missing_delivery_address" });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, error: "missing_items" });
+    }
+
+    // total
+    const total_clp = items.reduce((acc, it) => {
+      const q = Number(it.quantity || 0);
+      const p = Number(it.unit_price || 0);
+      return acc + q * p;
+    }, 0);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Validar que la reserva exista y esté activa
+      const r = await client.query(
+        `SELECT id, status, expires_at
+         FROM stock_reservations
+         WHERE id = $1`,
+        [reservation_id]
+      );
+
+      if (!r.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "reservation_not_found" });
+      }
+
+      const rs = r.rows[0];
+      if (rs.status !== "active" || new Date(rs.expires_at) <= new Date()) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ ok: false, error: "reservation_expired_or_not_active" });
+      }
+
+      // Insert (si ya existe por reintento, devolvemos la misma)
+      const ins = await client.query(
+        `INSERT INTO orders
+          (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp)
+         VALUES
+          ($1, 'pending_payment', $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (reservation_id)
+         DO UPDATE SET
+           buyer_name = EXCLUDED.buyer_name,
+           buyer_email = EXCLUDED.buyer_email,
+           buyer_phone = EXCLUDED.buyer_phone,
+           delivery_method = EXCLUDED.delivery_method,
+           delivery_address = EXCLUDED.delivery_address,
+           items = EXCLUDED.items,
+           total_clp = EXCLUDED.total_clp
+         RETURNING id, reservation_id, status, total_clp, created_at, updated_at`,
+        [
+          reservation_id,
+          buyer_name,
+          buyer_email || null,
+          buyer_phone || null,
+          delivery_method,
+          delivery_address || null,
+          JSON.stringify(items),
+          total_clp,
+        ]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ ok: true, order: ins.rows[0] });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("POST /orders error:", e);
+      return res.status(500).json({ ok: false, error: "orders_create_failed" });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("POST /orders fatal:", e);
+    return res.status(500).json({ ok: false, error: "orders_create_failed" });
+  }
+});
 
 // ===============================
 // ✅ START
