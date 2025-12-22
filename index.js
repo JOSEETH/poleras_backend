@@ -6,6 +6,9 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
+const { sendStoreNotificationEmail } = require("./email");
+
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -26,6 +29,7 @@ requireEnv("ADMIN_PASSWORD_HASH");
 requireEnv("ADMIN_JWT_SECRET");
 
 const mercadopago = require("mercadopago");
+
 
 // Configuración MP (solo se usa si el token es real)
 if (
@@ -156,6 +160,33 @@ app.get("/health", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+app.get("/test-email", async (req, res) => {
+  try {
+    const to = process.env.STORE_NOTIFY_EMAIL;
+    if (!to) {
+      return res.status(500).json({ error: "STORE_NOTIFY_EMAIL not set" });
+    }
+
+    await sendStoreNotificationEmail({
+      to,
+      subject: "✅ Test email — Poleras Huillinco",
+      html: `
+        <div style="font-family:Arial,sans-serif">
+          <h2>Test OK</h2>
+          <p>Si te llegó este correo, Resend está funcionando correctamente.</p>
+          <p><b>Fecha:</b> ${new Date().toISOString()}</p>
+        </div>
+      `,
+    });
+
+    return res.json({ ok: true, sent_to: to });
+  } catch (err) {
+    console.error("❌ Error sending test email:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 
 // ===============================
 // ✅ PUBLIC: VARIANTS (para formulario)
