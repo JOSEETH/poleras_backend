@@ -651,34 +651,37 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
 });
 
 // ===============================
-// ✅ ADMIN: RESUMEN DE VENTAS (físicas)
+// ✅ ADMIN: RESUMEN VENTAS (sale_offline)
 // GET /admin/sales-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
-// (usa ::date para incluir el día completo)
+// (filtra por fecha en horario Chile: America/Santiago)
 // ===============================
 app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
   try {
     const { from, to } = req.query || {};
 
-    const filters = [`movement_type = 'sale_offline'`];
+    const filters = [`sm.movement_type = 'sale_offline'`];
     const values = [];
     let i = 1;
 
     if (from) {
-  where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${i++}::date`);
-  values.push(from);
-}
+      filters.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${i++}::date`
+      );
+      values.push(String(from));
+    }
 
-if (to) {
-  where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${i++}::date`);
-  values.push(to);
-}
-
+    if (to) {
+      filters.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${i++}::date`
+      );
+      values.push(String(to));
+    }
 
     const q = `
       SELECT
-        COALESCE(SUM(quantity), 0)::int AS units_sold,
-        COALESCE(SUM(quantity * COALESCE(unit_price_clp,0)), 0)::bigint AS total_clp
-      FROM stock_movements
+        COALESCE(SUM(sm.quantity), 0)::int as units_sold,
+        COALESCE(SUM(sm.quantity * COALESCE(sm.unit_price_clp, 0)), 0)::bigint as total_clp
+      FROM stock_movements sm
       WHERE ${filters.join(" AND ")};
     `;
 
@@ -689,6 +692,7 @@ if (to) {
     return res.status(500).json({ ok: false, error: "sales_summary_failed" });
   }
 });
+
 
 // ===============================
 // ✅ ADMIN: UPDATE STOCK_TOTAL
