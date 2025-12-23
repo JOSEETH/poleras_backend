@@ -593,7 +593,7 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
 // ===============================
 // ✅ ADMIN: LISTAR MOVIMIENTOS
 // GET /admin/stock-movements?from=YYYY-MM-DD&to=YYYY-MM-DD&sku=...&type=...&variant_id=...
-// (usa ::date para que "to" incluya el día completo)
+// (filtra por fecha en horario Chile: America/Santiago)
 // ===============================
 app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
   try {
@@ -603,31 +603,32 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
     const values = [];
     let i = 1;
 
-if (variant_id) {
-  where.push(`sm.variant_id = $${i++}`);
-  values.push(String(variant_id));
-}
+    if (variant_id) {
+      where.push(`sm.variant_id = $${i++}`);
+      values.push(String(variant_id));
+    }
 
-if (type) {
-  where.push(`sm.movement_type = $${i++}`);
-  values.push(String(type));
-}
+    if (type) {
+      where.push(`sm.movement_type = $${i++}`);
+      values.push(String(type));
+    }
 
-if (from) {
-  where.push(`sm.occurred_at::date >= $${i++}::date`);
-  values.push(from);
-}
+    // ✅ FIX TZ Chile (America/Santiago)
+    if (from) {
+      where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${i++}::date`);
+      values.push(String(from));
+    }
 
-if (to) {
-  where.push(`sm.occurred_at::date <= $${i++}::date`);
-  values.push(to);
-}
+    // ✅ FIX TZ Chile (America/Santiago)
+    if (to) {
+      where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${i++}::date`);
+      values.push(String(to));
+    }
 
-if (sku) {
-  where.push(`pv.sku ILIKE $${i++}`);
-  values.push(`%${String(sku)}%`);
-}
-
+    if (sku) {
+      where.push(`pv.sku ILIKE $${i++}`);
+      values.push(`%${String(sku)}%`);
+    }
 
     const q = `
       SELECT
@@ -649,7 +650,6 @@ if (sku) {
   }
 });
 
-
 // ===============================
 // ✅ ADMIN: RESUMEN DE VENTAS (físicas)
 // GET /admin/sales-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -664,14 +664,15 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
     let i = 1;
 
     if (from) {
-      filters.push(`occurred_at::date >= $${i++}::date`);
-      values.push(from);
-    }
+  where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${i++}::date`);
+  values.push(from);
+}
 
-    if (to) {
-      filters.push(`occurred_at::date <= $${i++}::date`);
-      values.push(to);
-    }
+if (to) {
+  where.push(`(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${i++}::date`);
+  values.push(to);
+}
+
 
     const q = `
       SELECT
