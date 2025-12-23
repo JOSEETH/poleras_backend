@@ -599,34 +599,26 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
   try {
     const { from, to, sku, type, variant_id } = req.query || {};
 
-    const filters = [];
+    const where = [];
     const values = [];
     let i = 1;
 
-    if (from) { filters.push(`sm.occurred_at::date >= $${i++}::date`); values.push(from); }
-    if (to)   { filters.push(`sm.occurred_at::date <= $${i++}::date`); values.push(to); }
-    if (type) { filters.push(`sm.movement_type = $${i++}`); values.push(type); }
-    if (variant_id) { filters.push(`sm.variant_id = $${i++}`); values.push(String(variant_id)); }
-    if (sku)  { filters.push(`pv.sku ILIKE $${i++}`); values.push(`%${sku}%`); }
+    if (variant_id) { where.push(`sm.variant_id = $${i++}`); values.push(String(variant_id)); }
+    if (type)       { where.push(`sm.movement_type = $${i++}`); values.push(String(type)); }
 
-    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    if (from) { where.push(`sm.occurred_at >= $${i++}::date`); values.push(from); }
+    if (to)   { where.push(`sm.occurred_at < ($${i++}::date + INTERVAL '1 day')`); values.push(to); }
+
+    if (sku)  { where.push(`pv.sku ILIKE $${i++}`); values.push(`%${String(sku)}%`); }
 
     const q = `
       SELECT
-        sm.id,
-        sm.movement_type,
-        sm.quantity,
-        sm.unit_price_clp,
-        sm.note,
-        sm.occurred_at,
-        pv.id as variant_id,
-        pv.sku,
-        pv.color,
-        pv.size,
-        pv.grabado_nombre
+        sm.id, sm.occurred_at, sm.movement_type, sm.quantity, sm.unit_price_clp, sm.note,
+        sm.variant_id,
+        pv.sku, pv.color, pv.size, pv.grabado_nombre
       FROM stock_movements sm
       JOIN product_variants pv ON pv.id = sm.variant_id
-      ${where}
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY sm.occurred_at DESC
       LIMIT 500;
     `;
@@ -635,9 +627,10 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
     return res.json({ ok: true, movements: r.rows });
   } catch (e) {
     console.error("GET /admin/stock-movements error:", e);
-    return res.status(500).json({ ok: false, error: "stock_movements_failed" });
+    return res.status(500).json({ ok: false, error: "stock_movements_list_failed" });
   }
 });
+
 
 // ===============================
 // ✅ ADMIN: RESUMEN DE VENTAS (físicas)
@@ -648,19 +641,28 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
   try {
     const { from, to } = req.query || {};
 
-    const filters = [`movement_type = 'sale_offline'`];
+    const where = [`sm.movement_type = 'sale_offline'`];
     const values = [];
     let i = 1;
 
-    if (from) { filters.push(`occurred_at::date >= $${i++}::date`); values.push(from); }
-    if (to)   { filters.push(`occurred_at::date <= $${i++}::date`); values.push(to); }
+    // from: >= from 00:00 (como date)
+    if (from) {
+      where.push(`sm.occurred_at >= $${i++}::date`);
+      values.push(from);
+    }
+
+    // to: < (to + 1 día) para incluir todo el día "to"
+    if (to) {
+      where.push(`sm.occurred_at < ($${i++}::date + INTERVAL '1 day')`);
+      values.push(to);
+    }
 
     const q = `
       SELECT
-        COALESCE(SUM(quantity), 0)::int as units_sold,
-        COALESCE(SUM(quantity * COALESCE(unit_price_clp,0)), 0)::bigint as total_clp
-      FROM stock_movements
-      WHERE ${filters.join(" AND ")};
+        COALESCE(SUM(sm.quantity),0)::int as units_sold,
+        COALESCE(SUM(sm.quantity * COALESCE(sm.unit_price_clp,0)),0)::bigint as total_clp
+      FROM stock_movements sm
+      WHERE ${where.join(" AND ")};
     `;
 
     const r = await pool.query(q, values);
@@ -670,6 +672,7 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, error: "sales_summary_failed" });
   }
 });
+
 
 // ===============================
 // ✅ ADMIN: UPDATE STOCK_TOTAL
