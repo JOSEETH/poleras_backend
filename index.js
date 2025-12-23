@@ -1,3 +1,9 @@
+// ✅ REEMPLAZA TODO tu index.js por este archivo (ya corregido)
+// - Elimina duplicados de /move, /stock-movements, /sales-summary
+// - Saca la ruta /decrement que estaba pegada dentro de /stock (en tu versión)
+// - Deja filtros por fecha usando occurred_at::date para que el "to" incluya el día completo
+// - Mantiene todo lo demás igual
+
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -467,7 +473,12 @@ app.get("/admin/variants", requireAdmin, async (req, res) => {
 });
 
 // ===============================
-// ✅ ADMIN: STOCK MOVEMENT (venta/ajuste) + actualiza stock_total
+// ✅ ADMIN: STOCK MOVEMENTS (venta física / ajustes)
+// POST /admin/variants/:id/move
+// body: { movement_type, quantity, unit_price_clp, note, occurred_at? }
+// - sale_offline: descuenta stock_total + registra movimiento (requiere precio)
+// - adjust_out: descuenta stock_total + registra movimiento
+// - adjust_in: aumenta stock_total + registra movimiento
 // ===============================
 app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
   const { id } = req.params;
@@ -483,10 +494,11 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
     return res.status(400).json({ ok: false, error: "invalid_quantity" });
   }
 
-  // unit_price requerido solo si es venta
-  let price = null;
+  // precio requerido solo para ventas físicas
+  const price =
+    unit_price_clp === undefined || unit_price_clp === null ? null : Number(unit_price_clp);
+
   if (movement_type === "sale_offline") {
-    price = Number(unit_price_clp);
     if (!Number.isInteger(price) || price < 0) {
       return res.status(400).json({ ok: false, error: "invalid_unit_price_clp" });
     }
@@ -501,12 +513,11 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // limpiar expiradas para no romper validación reserved
     await cleanupExpiredReservations(client);
 
-    // lock variante
+    // bloquea variante
     const cur = await client.query(
-      `SELECT id, stock_total, stock_reserved, price_clp
+      `SELECT id, sku, stock_total, stock_reserved
        FROM product_variants
        WHERE id=$1
        FOR UPDATE`,
@@ -522,89 +533,100 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
     const stockTotal = Number(v.stock_total || 0);
     const reserved = Number(v.stock_reserved || 0);
 
-    // calcular nuevo stock_total según tipo
+    // calcula nuevo stock_total según tipo
     let newTotal = stockTotal;
-
-    if (movement_type === "adjust_in") {
-      newTotal = stockTotal + qty;
-    } else {
-      // sale_offline / adjust_out => baja
-      newTotal = stockTotal - qty;
-    }
+    if (movement_type === "adjust_in") newTotal = stockTotal + qty;
+    else newTotal = stockTotal - qty;
 
     if (newTotal < 0) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "stock_total_negative", current: stockTotal });
+      return res.status(409).json({ ok: false, error: "stock_total_negative" });
     }
-
-    // IMPORTANTÍSIMO: no permitir stock_total < reserved
     if (newTotal < reserved) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
         error: "stock_total_below_reserved",
         reserved,
-        requested: newTotal
+        current_total: stockTotal,
+        requested_new_total: newTotal,
       });
     }
 
-    // insertar movimiento (si es venta y no mandan precio, podrías usar el price_clp actual)
-    const finalPrice = movement_type === "sale_offline" ? price : null;
+    // update stock_total
+    const upd = await client.query(
+      `UPDATE product_variants
+       SET stock_total = $2
+       WHERE id = $1
+       RETURNING id, sku, stock_total, stock_reserved, (stock_total - stock_reserved) as stock_available`,
+      [id, newTotal]
+    );
 
-    const ins = await client.query(
+    // insert movimiento
+    const mov = await client.query(
       `INSERT INTO stock_movements
         (variant_id, movement_type, quantity, unit_price_clp, note, occurred_at)
        VALUES
         ($1, $2, $3, $4, $5, $6)
        RETURNING id, variant_id, movement_type, quantity, unit_price_clp, note, occurred_at`,
-      [id, movement_type, qty, finalPrice, note || null, when.toISOString()]
-    );
-
-    // actualizar stock_total
-    const up = await client.query(
-      `UPDATE product_variants
-       SET stock_total = $2
-       WHERE id = $1
-       RETURNING id, stock_total, stock_reserved, (stock_total - stock_reserved) AS stock_available`,
-      [id, newTotal]
+      [
+        id,
+        movement_type,
+        qty,
+        movement_type === "sale_offline" ? price : null,
+        note || null,
+        when.toISOString(),
+      ]
     );
 
     await client.query("COMMIT");
-    return res.json({ ok: true, movement: ins.rows[0], variant: up.rows[0] });
+    return res.json({ ok: true, variant: upd.rows[0], movement: mov.rows[0] });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("POST /admin/variants/:id/move error:", e);
-    return res.status(500).json({ ok: false, error: "stock_movement_failed" });
+    return res.status(500).json({ ok: false, error: "move_failed" });
   } finally {
     client.release();
   }
 });
 
 // ===============================
-// ✅ ADMIN: LISTAR MOVIMIENTOS (filtro por fechas opcional)
+// ✅ ADMIN: LISTAR MOVIMIENTOS
+// GET /admin/stock-movements?from=YYYY-MM-DD&to=YYYY-MM-DD&sku=...&type=...&variant_id=...
+// (usa ::date para que "to" incluya el día completo)
 // ===============================
 app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
   try {
-    const { from, to, sku, variant_id, type } = req.query;
+    const { from, to, sku, type, variant_id } = req.query || {};
 
-    const where = [];
+    const filters = [];
     const values = [];
     let i = 1;
 
-    if (variant_id) { where.push(`sm.variant_id = $${i++}`); values.push(String(variant_id)); }
-    if (type) { where.push(`sm.movement_type = $${i++}`); values.push(String(type)); }
-    if (from) { where.push(`sm.occurred_at >= $${i++}`); values.push(new Date(from).toISOString()); }
-    if (to) { where.push(`sm.occurred_at <= $${i++}`); values.push(new Date(to).toISOString()); }
-    if (sku) { where.push(`pv.sku ILIKE $${i++}`); values.push(`%${String(sku)}%`); }
+    if (from) { filters.push(`sm.occurred_at::date >= $${i++}::date`); values.push(from); }
+    if (to)   { filters.push(`sm.occurred_at::date <= $${i++}::date`); values.push(to); }
+    if (type) { filters.push(`sm.movement_type = $${i++}`); values.push(type); }
+    if (variant_id) { filters.push(`sm.variant_id = $${i++}`); values.push(String(variant_id)); }
+    if (sku)  { filters.push(`pv.sku ILIKE $${i++}`); values.push(`%${sku}%`); }
+
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
 
     const q = `
       SELECT
-        sm.id, sm.occurred_at, sm.movement_type, sm.quantity, sm.unit_price_clp, sm.note,
-        sm.variant_id,
-        pv.sku, pv.color, pv.size, pv.grabado_nombre
+        sm.id,
+        sm.movement_type,
+        sm.quantity,
+        sm.unit_price_clp,
+        sm.note,
+        sm.occurred_at,
+        pv.id as variant_id,
+        pv.sku,
+        pv.color,
+        pv.size,
+        pv.grabado_nombre
       FROM stock_movements sm
       JOIN product_variants pv ON pv.id = sm.variant_id
-      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ${where}
       ORDER BY sm.occurred_at DESC
       LIMIT 500;
     `;
@@ -613,30 +635,32 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
     return res.json({ ok: true, movements: r.rows });
   } catch (e) {
     console.error("GET /admin/stock-movements error:", e);
-    return res.status(500).json({ ok: false, error: "stock_movements_list_failed" });
+    return res.status(500).json({ ok: false, error: "stock_movements_failed" });
   }
 });
 
 // ===============================
-// ✅ ADMIN: RESUMEN VENTAS (sale_offline)
+// ✅ ADMIN: RESUMEN DE VENTAS (físicas)
+// GET /admin/sales-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+// (usa ::date para incluir el día completo)
 // ===============================
 app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to } = req.query || {};
 
+    const filters = [`movement_type = 'sale_offline'`];
     const values = [];
-    const where = [`sm.movement_type = 'sale_offline'`];
     let i = 1;
 
-    if (from) { where.push(`sm.occurred_at >= $${i++}`); values.push(new Date(from).toISOString()); }
-    if (to) { where.push(`sm.occurred_at <= $${i++}`); values.push(new Date(to).toISOString()); }
+    if (from) { filters.push(`occurred_at::date >= $${i++}::date`); values.push(from); }
+    if (to)   { filters.push(`occurred_at::date <= $${i++}::date`); values.push(to); }
 
     const q = `
       SELECT
-        COALESCE(SUM(sm.quantity),0)::int as units_sold,
-        COALESCE(SUM(sm.quantity * COALESCE(sm.unit_price_clp,0)),0)::bigint as total_clp
-      FROM stock_movements sm
-      WHERE ${where.join(" AND ")};
+        COALESCE(SUM(quantity), 0)::int as units_sold,
+        COALESCE(SUM(quantity * COALESCE(unit_price_clp,0)), 0)::bigint as total_clp
+      FROM stock_movements
+      WHERE ${filters.join(" AND ")};
     `;
 
     const r = await pool.query(q, values);
@@ -685,89 +709,6 @@ app.put("/admin/variants/:id/stock", requireAdmin, async (req, res) => {
         requested: stock_total,
       });
     }
-// ===============================
-// ✅ ADMIN: DECREMENT STOCK_TOTAL (ventas presenciales / merma)
-// POST /admin/variants/:id/decrement
-// Body: { quantity: 1 }
-// ===============================
-app.post("/admin/variants/:id/decrement", requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const qty = Number(req.body?.quantity);
-
-  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-  if (!Number.isInteger(qty) || qty <= 0) {
-    return res.status(400).json({ ok: false, error: "invalid_quantity" });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // Opcional pero recomendado: limpiar expiradas antes de tocar stock
-    await cleanupExpiredReservations(client);
-
-    // Bloquear fila para evitar carreras
-    const cur = await client.query(
-      `SELECT id, stock_total, stock_reserved
-       FROM product_variants
-       WHERE id = $1
-       FOR UPDATE`,
-      [id]
-    );
-
-    if (!cur.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
-    }
-
-    const stock_total = Number(cur.rows[0].stock_total || 0);
-    const stock_reserved = Number(cur.rows[0].stock_reserved || 0);
-
-    const new_total = stock_total - qty;
-
-    // No permitir negativo
-    if (new_total < 0) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: "insufficient_stock_total",
-        stock_total,
-        requested_decrement: qty,
-      });
-    }
-
-    // Regla crítica: stock_total jamás puede quedar bajo reserved
-    if (new_total < stock_reserved) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: "stock_total_below_reserved",
-        stock_total,
-        stock_reserved,
-        requested_decrement: qty,
-        would_be: new_total,
-      });
-    }
-
-    const up = await client.query(
-      `UPDATE product_variants
-       SET stock_total = $2
-       WHERE id = $1
-       RETURNING id, stock_total, stock_reserved, (stock_total - stock_reserved) AS stock_available`,
-      [id, new_total]
-    );
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, variant: up.rows[0], decremented: qty });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("POST /admin/variants/:id/decrement error:", e);
-    return res.status(500).json({ ok: false, error: "admin_decrement_failed" });
-  } finally {
-    client.release();
-  }
-});
-
 
     const updated = await client.query(
       `
@@ -1108,191 +1049,6 @@ app.post("/mp/webhook", async (req, res) => {
     console.error("MP webhook error:", e);
   }
 });
-
-// ===============================
-// ✅ ADMIN: STOCK MOVEMENTS (venta física / ajustes)
-// POST /admin/variants/:id/move
-// body: { movement_type, quantity, unit_price_clp, note }
-// - sale_offline: descuenta stock_total + registra movimiento
-// - adjust_out: descuenta stock_total + registra movimiento
-// - adjust_in: aumenta stock_total + registra movimiento
-// ===============================
-app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { movement_type, quantity, unit_price_clp, note } = req.body || {};
-
-  const qty = Number(quantity);
-
-  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-  if (!["sale_offline", "adjust_out", "adjust_in"].includes(movement_type)) {
-    return res.status(400).json({ ok: false, error: "invalid_movement_type" });
-  }
-  if (!Number.isInteger(qty) || qty <= 0) {
-    return res.status(400).json({ ok: false, error: "invalid_quantity" });
-  }
-
-  // precio requerido solo para ventas físicas
-  const price = unit_price_clp === undefined || unit_price_clp === null ? null : Number(unit_price_clp);
-  if (movement_type === "sale_offline") {
-    if (!Number.isInteger(price) || price < 0) {
-      return res.status(400).json({ ok: false, error: "invalid_unit_price_clp" });
-    }
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // limpia reservas vencidas antes de validar reserved
-    await cleanupExpiredReservations(client);
-
-    // bloquea variante
-    const cur = await client.query(
-      `SELECT id, sku, stock_total, stock_reserved
-       FROM product_variants
-       WHERE id=$1
-       FOR UPDATE`,
-      [id]
-    );
-
-    if (!cur.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
-    }
-
-    const v = cur.rows[0];
-    const stockTotal = Number(v.stock_total || 0);
-    const reserved = Number(v.stock_reserved || 0);
-
-    // calcula nuevo stock_total según tipo
-    let newTotal = stockTotal;
-    if (movement_type === "adjust_in") newTotal = stockTotal + qty;
-    else newTotal = stockTotal - qty; // sale_offline / adjust_out
-
-    if (newTotal < 0) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "stock_total_negative" });
-    }
-    if (newTotal < reserved) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: "stock_total_below_reserved",
-        reserved,
-        current_total: stockTotal,
-        requested_new_total: newTotal,
-      });
-    }
-
-    // update stock_total
-    const upd = await client.query(
-      `UPDATE product_variants
-       SET stock_total = $2
-       WHERE id = $1
-       RETURNING id, sku, stock_total, stock_reserved, (stock_total - stock_reserved) as stock_available`,
-      [id, newTotal]
-    );
-
-    // insert movimiento
-    const mov = await client.query(
-      `INSERT INTO stock_movements
-        (variant_id, movement_type, quantity, unit_price_clp, note)
-       VALUES
-        ($1, $2, $3, $4, $5)
-       RETURNING id, variant_id, movement_type, quantity, unit_price_clp, note, occurred_at`,
-      [id, movement_type, qty, movement_type === "sale_offline" ? price : null, note || null]
-    );
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, variant: upd.rows[0], movement: mov.rows[0] });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("POST /admin/variants/:id/move error:", e);
-    return res.status(500).json({ ok: false, error: "move_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ===============================
-// ✅ ADMIN: LISTAR MOVIMIENTOS
-// GET /admin/stock-movements?from=YYYY-MM-DD&to=YYYY-MM-DD&sku=...&type=...
-// ===============================
-app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
-  try {
-    const { from, to, sku, type } = req.query || {};
-
-    // filtros opcionales (por fecha se usa occurred_at::date para evitar problemas de hora)
-    const filters = [];
-    const values = [];
-    let i = 1;
-
-    if (from) { filters.push(`sm.occurred_at::date >= $${i++}::date`); values.push(from); }
-    if (to)   { filters.push(`sm.occurred_at::date <= $${i++}::date`); values.push(to); }
-    if (type) { filters.push(`sm.movement_type = $${i++}`); values.push(type); }
-    if (sku)  { filters.push(`pv.sku ILIKE $${i++}`); values.push(`%${sku}%`); }
-
-    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
-
-    const q = `
-      SELECT
-        sm.id,
-        sm.movement_type,
-        sm.quantity,
-        sm.unit_price_clp,
-        sm.note,
-        sm.occurred_at,
-        pv.id as variant_id,
-        pv.sku,
-        pv.color,
-        pv.size,
-        pv.grabado_nombre
-      FROM stock_movements sm
-      JOIN product_variants pv ON pv.id = sm.variant_id
-      ${where}
-      ORDER BY sm.occurred_at DESC
-      LIMIT 500;
-    `;
-
-    const r = await pool.query(q, values);
-    return res.json({ ok: true, movements: r.rows });
-  } catch (e) {
-    console.error("GET /admin/stock-movements error:", e);
-    return res.status(500).json({ ok: false, error: "stock_movements_failed" });
-  }
-});
-
-// ===============================
-// ✅ ADMIN: RESUMEN DE VENTAS (físicas)
-// GET /admin/sales-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
-// ===============================
-app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
-  try {
-    const { from, to } = req.query || {};
-
-    const filters = [`movement_type = 'sale_offline'`];
-    const values = [];
-    let i = 1;
-
-    if (from) { filters.push(`occurred_at::date >= $${i++}::date`); values.push(from); }
-    if (to)   { filters.push(`occurred_at::date <= $${i++}::date`); values.push(to); }
-
-    const q = `
-      SELECT
-        COALESCE(SUM(quantity), 0)::int as units_sold,
-        COALESCE(SUM(quantity * COALESCE(unit_price_clp,0)), 0)::bigint as total_clp
-      FROM stock_movements
-      WHERE ${filters.join(" AND ")};
-    `;
-
-    const r = await pool.query(q, values);
-    return res.json({ ok: true, ...r.rows[0] });
-  } catch (e) {
-    console.error("GET /admin/sales-summary error:", e);
-    return res.status(500).json({ ok: false, error: "sales_summary_failed" });
-  }
-});
-
 
 // ===============================
 // ✅ START
