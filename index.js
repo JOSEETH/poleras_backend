@@ -603,13 +603,31 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
     const values = [];
     let i = 1;
 
-    if (variant_id) { where.push(`sm.variant_id = $${i++}`); values.push(String(variant_id)); }
-    if (type)       { where.push(`sm.movement_type = $${i++}`); values.push(String(type)); }
+if (variant_id) {
+  where.push(`sm.variant_id = $${i++}`);
+  values.push(String(variant_id));
+}
 
-    if (from) { where.push(`sm.occurred_at >= $${i++}::date`); values.push(from); }
-    if (to)   { where.push(`sm.occurred_at < ($${i++}::date + INTERVAL '1 day')`); values.push(to); }
+if (type) {
+  where.push(`sm.movement_type = $${i++}`);
+  values.push(String(type));
+}
 
-    if (sku)  { where.push(`pv.sku ILIKE $${i++}`); values.push(`%${String(sku)}%`); }
+if (from) {
+  where.push(`sm.occurred_at::date >= $${i++}::date`);
+  values.push(from);
+}
+
+if (to) {
+  where.push(`sm.occurred_at::date <= $${i++}::date`);
+  values.push(to);
+}
+
+if (sku) {
+  where.push(`pv.sku ILIKE $${i++}`);
+  values.push(`%${String(sku)}%`);
+}
+
 
     const q = `
       SELECT
@@ -641,28 +659,26 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
   try {
     const { from, to } = req.query || {};
 
-    const where = [`sm.movement_type = 'sale_offline'`];
+    const filters = [`movement_type = 'sale_offline'`];
     const values = [];
     let i = 1;
 
-    // from: >= from 00:00 (como date)
     if (from) {
-      where.push(`sm.occurred_at >= $${i++}::date`);
+      filters.push(`occurred_at::date >= $${i++}::date`);
       values.push(from);
     }
 
-    // to: < (to + 1 día) para incluir todo el día "to"
     if (to) {
-      where.push(`sm.occurred_at < ($${i++}::date + INTERVAL '1 day')`);
+      filters.push(`occurred_at::date <= $${i++}::date`);
       values.push(to);
     }
 
     const q = `
       SELECT
-        COALESCE(SUM(sm.quantity),0)::int as units_sold,
-        COALESCE(SUM(sm.quantity * COALESCE(sm.unit_price_clp,0)),0)::bigint as total_clp
-      FROM stock_movements sm
-      WHERE ${where.join(" AND ")};
+        COALESCE(SUM(quantity), 0)::int AS units_sold,
+        COALESCE(SUM(quantity * COALESCE(unit_price_clp,0)), 0)::bigint AS total_clp
+      FROM stock_movements
+      WHERE ${filters.join(" AND ")};
     `;
 
     const r = await pool.query(q, values);
@@ -672,7 +688,6 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, error: "sales_summary_failed" });
   }
 });
-
 
 // ===============================
 // ✅ ADMIN: UPDATE STOCK_TOTAL
