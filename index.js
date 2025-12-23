@@ -8,6 +8,7 @@ const bcrypt = require("bcryptjs");
 
 const { sendStoreNotificationEmail } = require("./email");
 
+const mercadopago = require("mercadopago");
 
 const app = express();
 app.use(cors());
@@ -28,19 +29,10 @@ requireEnv("ADMIN_EMAIL");
 requireEnv("ADMIN_PASSWORD_HASH");
 requireEnv("ADMIN_JWT_SECRET");
 
-const mercadopago = require("mercadopago");
-
-
-// Configuración MP (solo se usa si el token es real)
-if (
-  process.env.MP_ACCESS_TOKEN &&
-  process.env.MP_ACCESS_TOKEN !== "PENDIENTE_CLIENTE"
-) {
-  mercadopago.configure({
-    access_token: process.env.MP_ACCESS_TOKEN,
-  });
-}
-
+// 🔥 Recomendado (siempre que quieras email real sí o sí)
+// Si aún quieres que el backend corra aunque falte alguno, comenta estas dos líneas.
+requireEnv("RESEND_API_KEY");
+requireEnv("STORE_NOTIFY_EMAIL");
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -119,10 +111,6 @@ app.post("/admin/login", async (req, res) => {
 // 🔓 CLEANUP STOCK VENCIDO (reusable)
 // ===============================
 async function cleanupExpiredReservations(client) {
-  // Limpia reservas vencidas:
-  // - resta quantity desde product_variants.stock_reserved
-  // - marca stock_reservations.status='expired'
-  // NOTA: no toca stock_total
   const q = `
     WITH expired AS (
       SELECT id, variant_id, quantity
@@ -161,11 +149,14 @@ app.get("/health", async (req, res) => {
   }
 });
 
+// ===============================
+// ✅ TEST EMAIL (manual)
+// ===============================
 app.get("/test-email", async (req, res) => {
   try {
     const to = process.env.STORE_NOTIFY_EMAIL;
     if (!to) {
-      return res.status(500).json({ error: "STORE_NOTIFY_EMAIL not set" });
+      return res.status(500).json({ ok: false, error: "STORE_NOTIFY_EMAIL not set" });
     }
 
     await sendStoreNotificationEmail({
@@ -186,7 +177,6 @@ app.get("/test-email", async (req, res) => {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
-
 
 // ===============================
 // ✅ PUBLIC: VARIANTS (para formulario)
@@ -345,517 +335,6 @@ app.post("/reserve", async (req, res) => {
 });
 
 // ===============================
-// ✅ ADMIN: LISTAR VARIANTES
-// (devuelve { ok:true, variants:[...] } para compatibilidad con admin.html)
-// ===============================
-app.get("/admin/variants", requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    // opcional: limpiar expiradas antes de mostrar
-    await cleanupExpiredReservations(client);
-
-    const q = `
-      select
-        id, sku, color, size, grabado_codigo, grabado_nombre,
-        price_clp,
-        stock_total,
-        stock_reserved,
-        (stock_total - stock_reserved) as stock_available,
-        active,
-        created_at
-      from product_variants
-      order by color, grabado_codigo, size;
-    `;
-    const r = await client.query(q);
-    return res.json({ ok: true, variants: r.rows });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: "admin_variants_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ===============================
-// ✅ ADMIN: UPDATE STOCK_TOTAL
-// ===============================
-app.put("/admin/variants/:id/stock", requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { stock_total } = req.body || {};
-
-  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-  if (!Number.isInteger(stock_total) || stock_total < 0) {
-    return res.status(400).json({ ok: false, error: "invalid_stock_total" });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    await cleanupExpiredReservations(client);
-
-    const current = await client.query(
-      `SELECT stock_reserved FROM product_variants WHERE id=$1 FOR UPDATE`,
-      [id]
-    );
-
-    if (current.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
-    }
-
-    const reserved = Number(current.rows[0].stock_reserved || 0);
-
-    // no permitir stock_total < stock_reserved
-    if (stock_total < reserved) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: "stock_total_below_reserved",
-        reserved,
-        requested: stock_total,
-      });
-    }
-
-    const updated = await client.query(
-      `
-      UPDATE product_variants
-      SET stock_total=$2
-      WHERE id=$1
-      RETURNING id, stock_total, stock_reserved, (stock_total - stock_reserved) AS stock_available
-      `,
-      [id, stock_total]
-    );
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, variant: updated.rows[0] });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error(e);
-    return res
-      .status(500)
-      .json({ ok: false, error: "admin_update_stock_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ===============================
-// ✅ ADMIN: UPDATE PRICE_CLP
-// ===============================
-app.put("/admin/variants/:id/price", requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { price_clp } = req.body || {};
-
-  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-  if (!Number.isInteger(price_clp) || price_clp < 0) {
-    return res.status(400).json({ ok: false, error: "invalid_price_clp" });
-  }
-
-  const client = await pool.connect();
-  try {
-    const r = await client.query(
-      `
-      UPDATE product_variants
-      SET price_clp=$2
-      WHERE id=$1
-      RETURNING id, price_clp
-      `,
-      [id, price_clp]
-    );
-
-    if (!r.rowCount) {
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
-    }
-
-    return res.json({ ok: true, variant: r.rows[0] });
-  } catch (e) {
-    console.error(e);
-    return res
-      .status(500)
-      .json({ ok: false, error: "admin_update_price_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ===============================
-// ✅ ADMIN: PATCH opcional (active + price/stock seguro)
-// Si lo usas, es para updates “rápidos”.
-// ===============================
-app.patch("/admin/variants/:id", requireAdmin, async (req, res) => {
-  const id = req.params.id;
-  const { price_clp, stock_total, active } = req.body || {};
-
-  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
-
-  const fields = [];
-  const values = [];
-  let i = 1;
-
-  // price
-  if (price_clp !== undefined) {
-    const p = Number(price_clp);
-    if (!Number.isFinite(p) || p < 0 || !Number.isInteger(p)) {
-      return res.status(400).json({ ok: false, error: "invalid_price_clp" });
-    }
-    fields.push(`price_clp = $${i++}`);
-    values.push(p);
-  }
-
-  // stock_total (se valida contra reserved dentro de transacción)
-  const wantsStock = stock_total !== undefined;
-  let stockToSet = null;
-  if (wantsStock) {
-    const s = Number(stock_total);
-    if (!Number.isFinite(s) || s < 0 || !Number.isInteger(s)) {
-      return res.status(400).json({ ok: false, error: "invalid_stock_total" });
-    }
-    stockToSet = s;
-    fields.push(`stock_total = $${i++}`);
-    values.push(s);
-  }
-
-  // active
-  if (active !== undefined) {
-    const a = Boolean(active);
-    fields.push(`active = $${i++}`);
-    values.push(a);
-  }
-
-  if (fields.length === 0) {
-    return res.status(400).json({ ok: false, error: "nothing_to_update" });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // si toca stock, valida stock_total >= reserved
-    if (wantsStock) {
-      await cleanupExpiredReservations(client);
-
-      const cur = await client.query(
-        `SELECT stock_reserved FROM product_variants WHERE id=$1 FOR UPDATE`,
-        [id]
-      );
-      if (!cur.rowCount) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ ok: false, error: "variant_not_found" });
-      }
-
-      const reserved = Number(cur.rows[0].stock_reserved || 0);
-      if (stockToSet < reserved) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          ok: false,
-          error: "stock_total_below_reserved",
-          reserved,
-          requested: stockToSet,
-        });
-      }
-    }
-
-    values.push(id);
-
-    const q = `
-      update product_variants
-      set ${fields.join(", ")}
-      where id = $${i}
-      returning
-        id, sku, color, size, grabado_codigo, grabado_nombre,
-        price_clp, stock_total, stock_reserved,
-        (stock_total - stock_reserved) as stock_available,
-        active;
-    `;
-
-    const r = await client.query(q, values);
-
-    if (!r.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
-    }
-
-    await client.query("COMMIT");
-    return res.json({ ok: true, variant: r.rows[0] });
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error(e);
-    return res.status(500).json({ ok: false, error: "admin_patch_failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ===============================
-// ✅ MERCADO PAGO — STUB
-// ===============================
-app.post("/mp/create-preference", async (req, res) => {
-  const { reservation_id } = req.body || {};
-  if (!reservation_id) {
-    return res.status(400).json({ ok: false, error: "missing_reservation_id" });
-  }
-
-  // 🟡 STUB si no hay token real
-  if (
-    !process.env.MP_ACCESS_TOKEN ||
-    process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
-  ) {
-    return res.json({
-      ok: true,
-      stub: true,
-      init_point:
-        "https://example.com/mp-stub?reservation_id=" +
-        encodeURIComponent(reservation_id),
-    });
-  }
-
-      // ============================
-    // ✅ CUANDO MP SEA REAL (activar)
-    // ============================
-    /*
-    await client.query("BEGIN");
-
-    // 1) Extraer payment_id desde el webhook (depende del formato exacto)
-    const paymentId = event?.data?.id;
-
-    // 2) Consultar pago a MP y verificar approved
-    const payment = await mercadopago.payment.findById(paymentId);
-    if (payment?.body?.status !== "approved") {
-      await client.query("ROLLBACK");
-      return res.status(200).send("ok");
-    }
-
-    // 3) Sacar reservation_id desde metadata del pago
-    const reservation_id = payment?.body?.metadata?.reservation_id;
-    if (!reservation_id) {
-      await client.query("ROLLBACK");
-      return res.status(200).send("ok");
-    }
-
-    // 4) Confirmar reserva (Opción A)
-    const confirmed = await confirmReservation_holdReserved(client, reservation_id);
-    if (!confirmed) {
-      await client.query("ROLLBACK");
-      return res.status(200).send("ok");
-    }
-
-    await client.query("COMMIT");
-    */
-
-
-  // 🟢 MP REAL
-  try {
-    const r = await pool.query(
-      `
-      SELECT sr.id, sr.quantity, pv.price_clp, pv.sku
-      FROM stock_reservations sr
-      JOIN product_variants pv ON pv.id = sr.variant_id
-      WHERE sr.id = $1 AND sr.status = 'active'
-      `,
-      [reservation_id]
-    );
-
-    if (!r.rowCount) {
-      return res.status(404).json({
-        ok: false,
-        error: "reservation_not_found_or_expired",
-      });
-    }
-
-    const item = r.rows[0];
-
-    const preference = {
-      items: [
-        {
-          id: item.sku,
-          title: "Polera Huillinco",
-          quantity: item.quantity,
-          currency_id: "CLP",
-          unit_price: Number(item.price_clp),
-        },
-      ],
-      external_reference: reservation_id,
-      metadata: { reservation_id },
-      back_urls: {
-        success: "https://TU-SITIO.cl/success",
-        failure: "https://TU-SITIO.cl/failure",
-        pending: "https://TU-SITIO.cl/pending",
-      },
-      auto_return: "approved",
-      notification_url:
-        "https://poleras-backend.onrender.com/mp/webhook",
-    };
-
-    const mpRes = await mercadopago.preferences.create(preference);
-
-    return res.json({
-      ok: true,
-      init_point: mpRes.body.init_point,
-      mp_preference_id: mpRes.body.id,
-    });
-  } catch (e) {
-    console.error("MP create preference error:", e);
-    return res.status(500).json({
-      ok: false,
-      error: "mp_create_preference_failed",
-    });
-  }
-});
-
-// ===============================
-// ✅ MP – Confirmación de reserva (helpers)
-// ===============================
-
-// Opción A (segura con tu regla actual):
-// - marca la reserva como confirmed
-// - NO toca stock_total
-// - NO reduce stock_reserved (porque eso "liberaría" stock y permitiría sobreventa)
-// Ideal si luego crearás una tabla orders/ventas para controlar stock vendido.
-async function confirmReservation_holdReserved(client, reservation_id) {
-  const q = `
-    UPDATE stock_reservations
-    SET status = 'confirmed'
-    WHERE id = $1
-      AND status = 'active'
-      AND expires_at > NOW()
-    RETURNING id, variant_id, quantity, expires_at, status;
-  `;
-  const r = await client.query(q, [reservation_id]);
-  return r.rows[0] || null;
-}
-
-// Opción B (stock "clásico"):
-// - marca confirmed
-// - descuenta stock_total (venta definitiva)
-// - reduce stock_reserved (porque ya no es temporal)
-// Esto es lo más correcto si NO tendrás tabla orders aún.
-async function confirmReservation_decrementTotal(client, reservation_id) {
-  const q = `
-    WITH target AS (
-      SELECT id, variant_id, quantity
-      FROM stock_reservations
-      WHERE id = $1
-        AND status = 'active'
-        AND expires_at > NOW()
-      FOR UPDATE
-    ),
-    updated_variant AS (
-      UPDATE product_variants pv
-      SET
-        stock_total = GREATEST(pv.stock_total - t.quantity, 0),
-        stock_reserved = GREATEST(pv.stock_reserved - t.quantity, 0)
-      FROM target t
-      WHERE pv.id = t.variant_id
-      RETURNING pv.id, pv.stock_total, pv.stock_reserved
-    )
-    UPDATE stock_reservations sr
-    SET status = 'confirmed'
-    FROM target t
-    WHERE sr.id = t.id
-    RETURNING sr.id, sr.variant_id, sr.quantity, sr.status;
-  `;
-  const r = await client.query(q, [reservation_id]);
-  return r.rows[0] || null;
-}
-
-
-app.post("/mp/webhook", async (req, res) => {
-  try {
-    // Responder rápido siempre
-    res.status(200).send("ok");
-
-    const event = req.body;
-    console.log("MP webhook recibido:", event);
-
-    // Si no hay token real aún, no hacemos nada (stub)
-    if (
-      !process.env.MP_ACCESS_TOKEN ||
-      process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
-    ) {
-      console.log("MP webhook: MP_ACCESS_TOKEN pendiente, ignorando.");
-      return;
-    }
-
-    // 1) Extraer payment id desde el webhook
-    const paymentId = event?.data?.id;
-    if (!paymentId) {
-      console.log("MP webhook: no paymentId en event.data.id");
-      return;
-    }
-
-    // 2) Consultar payment real con SDK
-    const payment = await mercadopago.payment.findById(paymentId);
-    const status = payment?.body?.status;
-
-    if (status !== "approved") {
-      console.log("MP webhook: pago no aprobado:", status);
-      return;
-    }
-
-    // 3) Leer reservation_id desde metadata o external_reference
-    const reservation_id =
-      payment?.body?.metadata?.reservation_id ||
-      payment?.body?.external_reference;
-
-    if (!reservation_id) {
-      console.log("MP webhook: falta reservation_id en payment");
-      return;
-    }
-
-    // 4) Confirmar reserva en DB (TU OPCIÓN A)
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const confirmed = await confirmReservation_holdReserved(
-        client,
-        reservation_id
-      );
-
-      if (!confirmed) {
-        await client.query("ROLLBACK");
-        console.log("MP webhook: reserva no confirmada (ya confirmada o expirada)", reservation_id);
-        return;
-      }
-
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK");
-      console.error("MP webhook: error DB:", e);
-      return;
-    } finally {
-      client.release();
-    }
-
-    // 5) Enviar email a Huillinco (SOLO CON PAGO APROBADO)
-    const to = process.env.STORE_NOTIFY_EMAIL;
-    if (!to) {
-      console.log("MP webhook: falta STORE_NOTIFY_EMAIL");
-      return;
-    }
-
-    await sendStoreNotificationEmail({
-      to,
-      subject: "✅ Pago aprobado — Poleras Huillinco",
-      html: `
-        <div style="font-family:Arial,sans-serif">
-          <h2>✅ Pago aprobado</h2>
-          <p><b>Reserva:</b> ${reservation_id}</p>
-          <p><b>Payment ID:</b> ${paymentId}</p>
-          <p>Ahora corresponde contactar al cliente y coordinar retiro/envío por pagar.</p>
-        </div>
-      `,
-    });
-
-    console.log("MP webhook: confirmado + email enviado", reservation_id);
-  } catch (e) {
-    console.error("MP webhook error:", e);
-    // ya respondimos 200 arriba, solo log
-  }
-});
-
-// ===============================
 // ✅ ORDERS (crear orden antes de pagar)
 // ===============================
 app.post("/orders", async (req, res) => {
@@ -886,7 +365,6 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_items" });
     }
 
-    // total
     const total_clp = items.reduce((acc, it) => {
       const q = Number(it.quantity || 0);
       const p = Number(it.unit_price || 0);
@@ -916,7 +394,6 @@ app.post("/orders", async (req, res) => {
         return res.status(409).json({ ok: false, error: "reservation_expired_or_not_active" });
       }
 
-      // Insert (si ya existe por reintento, devolvemos la misma)
       const ins = await client.query(
         `INSERT INTO orders
           (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp)
@@ -956,6 +433,415 @@ app.post("/orders", async (req, res) => {
   } catch (e) {
     console.error("POST /orders fatal:", e);
     return res.status(500).json({ ok: false, error: "orders_create_failed" });
+  }
+});
+
+// ===============================
+// ✅ ADMIN: LISTAR VARIANTES
+// ===============================
+app.get("/admin/variants", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await cleanupExpiredReservations(client);
+
+    const q = `
+      select
+        id, sku, color, size, grabado_codigo, grabado_nombre,
+        price_clp,
+        stock_total,
+        stock_reserved,
+        (stock_total - stock_reserved) as stock_available,
+        active,
+        created_at
+      from product_variants
+      order by color, grabado_codigo, size;
+    `;
+    const r = await client.query(q);
+    return res.json({ ok: true, variants: r.rows });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: "admin_variants_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+// ===============================
+// ✅ ADMIN: UPDATE STOCK_TOTAL
+// ===============================
+app.put("/admin/variants/:id/stock", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { stock_total } = req.body || {};
+
+  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+  if (!Number.isInteger(stock_total) || stock_total < 0) {
+    return res.status(400).json({ ok: false, error: "invalid_stock_total" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await cleanupExpiredReservations(client);
+
+    const current = await client.query(
+      `SELECT stock_reserved FROM product_variants WHERE id=$1 FOR UPDATE`,
+      [id]
+    );
+
+    if (current.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "variant_not_found" });
+    }
+
+    const reserved = Number(current.rows[0].stock_reserved || 0);
+
+    if (stock_total < reserved) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        error: "stock_total_below_reserved",
+        reserved,
+        requested: stock_total,
+      });
+    }
+
+    const updated = await client.query(
+      `
+      UPDATE product_variants
+      SET stock_total=$2
+      WHERE id=$1
+      RETURNING id, stock_total, stock_reserved, (stock_total - stock_reserved) AS stock_available
+      `,
+      [id, stock_total]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, variant: updated.rows[0] });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    return res.status(500).json({ ok: false, error: "admin_update_stock_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+// ===============================
+// ✅ ADMIN: UPDATE PRICE_CLP
+// ===============================
+app.put("/admin/variants/:id/price", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { price_clp } = req.body || {};
+
+  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+  if (!Number.isInteger(price_clp) || price_clp < 0) {
+    return res.status(400).json({ ok: false, error: "invalid_price_clp" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const r = await client.query(
+      `
+      UPDATE product_variants
+      SET price_clp=$2
+      WHERE id=$1
+      RETURNING id, price_clp
+      `,
+      [id, price_clp]
+    );
+
+    if (!r.rowCount) {
+      return res.status(404).json({ ok: false, error: "variant_not_found" });
+    }
+
+    return res.json({ ok: true, variant: r.rows[0] });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: "admin_update_price_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+// ===============================
+// ✅ Configuración MP (solo se usa si el token es real)
+// ===============================
+if (
+  process.env.MP_ACCESS_TOKEN &&
+  process.env.MP_ACCESS_TOKEN !== "PENDIENTE_CLIENTE"
+) {
+  mercadopago.configure({
+    access_token: process.env.MP_ACCESS_TOKEN,
+  });
+}
+
+// ===============================
+// ✅ MERCADO PAGO — create preference
+// ===============================
+app.post("/mp/create-preference", async (req, res) => {
+  const { reservation_id } = req.body || {};
+  if (!reservation_id) {
+    return res.status(400).json({ ok: false, error: "missing_reservation_id" });
+  }
+
+  // 🟡 STUB si no hay token real
+  if (
+    !process.env.MP_ACCESS_TOKEN ||
+    process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
+  ) {
+    return res.json({
+      ok: true,
+      stub: true,
+      init_point:
+        "https://example.com/mp-stub?reservation_id=" +
+        encodeURIComponent(reservation_id),
+    });
+  }
+
+  try {
+    const r = await pool.query(
+      `
+      SELECT sr.id, sr.quantity, pv.price_clp, pv.sku
+      FROM stock_reservations sr
+      JOIN product_variants pv ON pv.id = sr.variant_id
+      WHERE sr.id = $1 AND sr.status = 'active'
+      `,
+      [reservation_id]
+    );
+
+    if (!r.rowCount) {
+      return res.status(404).json({
+        ok: false,
+        error: "reservation_not_found_or_expired",
+      });
+    }
+
+    const item = r.rows[0];
+
+    const preference = {
+      items: [
+        {
+          id: item.sku,
+          title: "Polera Huillinco",
+          quantity: item.quantity,
+          currency_id: "CLP",
+          unit_price: Number(item.price_clp),
+        },
+      ],
+      external_reference: reservation_id,
+      metadata: { reservation_id },
+      back_urls: {
+        success: "https://TU-SITIO.cl/success",
+        failure: "https://TU-SITIO.cl/failure",
+        pending: "https://TU-SITIO.cl/pending",
+      },
+      auto_return: "approved",
+      notification_url: "https://poleras-backend.onrender.com/mp/webhook",
+    };
+
+    const mpRes = await mercadopago.preferences.create(preference);
+
+    return res.json({
+      ok: true,
+      init_point: mpRes.body.init_point,
+      mp_preference_id: mpRes.body.id,
+    });
+  } catch (e) {
+    console.error("MP create preference error:", e);
+    return res.status(500).json({
+      ok: false,
+      error: "mp_create_preference_failed",
+    });
+  }
+});
+
+// ===============================
+// ✅ MP – Confirmación de reserva (helpers)
+// ===============================
+async function confirmReservation_holdReserved(client, reservation_id) {
+  const q = `
+    UPDATE stock_reservations
+    SET status = 'confirmed'
+    WHERE id = $1
+      AND status = 'active'
+      AND expires_at > NOW()
+    RETURNING id, variant_id, quantity, expires_at, status;
+  `;
+  const r = await client.query(q, [reservation_id]);
+  return r.rows[0] || null;
+}
+
+// ===============================
+// ✅ MP WEBHOOK (pago aprobado -> confirma + email)
+// ===============================
+app.post("/mp/webhook", async (req, res) => {
+  try {
+    // Responder rápido siempre
+    res.status(200).send("ok");
+
+    const event = req.body;
+    console.log("MP webhook recibido:", event);
+
+    if (
+      !process.env.MP_ACCESS_TOKEN ||
+      process.env.MP_ACCESS_TOKEN === "PENDIENTE_CLIENTE"
+    ) {
+      console.log("MP webhook: MP_ACCESS_TOKEN pendiente, ignorando.");
+      return;
+    }
+
+    const paymentId = event?.data?.id;
+    if (!paymentId) {
+      console.log("MP webhook: no paymentId en event.data.id");
+      return;
+    }
+
+    const payment = await mercadopago.payment.findById(paymentId);
+    const status = payment?.body?.status;
+
+    if (status !== "approved") {
+      console.log("MP webhook: pago no aprobado:", status);
+      return;
+    }
+
+    const reservation_id =
+      payment?.body?.metadata?.reservation_id ||
+      payment?.body?.external_reference;
+
+    if (!reservation_id) {
+      console.log("MP webhook: falta reservation_id en payment");
+      return;
+    }
+
+    // Confirmar reserva (Opción A)
+    const client = await pool.connect();
+    let confirmed = null;
+
+    try {
+      await client.query("BEGIN");
+      confirmed = await confirmReservation_holdReserved(client, reservation_id);
+
+      if (!confirmed) {
+        await client.query("ROLLBACK");
+        console.log("MP webhook: reserva no confirmada (ya confirmada o expirada)", reservation_id);
+        return;
+      }
+
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("MP webhook: error DB:", e);
+      return;
+    } finally {
+      client.release();
+    }
+
+    // Buscar order para armar email completo
+    const orderRes = await pool.query(
+      `SELECT reservation_id, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp
+       FROM orders
+       WHERE reservation_id = $1
+       LIMIT 1`,
+      [reservation_id]
+    );
+
+    const to = process.env.STORE_NOTIFY_EMAIL;
+    if (!to) {
+      console.log("MP webhook: falta STORE_NOTIFY_EMAIL");
+      return;
+    }
+
+    if (!orderRes.rowCount) {
+      // Email mínimo si no hay order guardada
+      await sendStoreNotificationEmail({
+        to,
+        subject: "✅ Pago aprobado — Poleras Huillinco",
+        html: `
+          <div style="font-family:Arial,sans-serif">
+            <h2>✅ Pago aprobado</h2>
+            <p><b>Reserva:</b> ${reservation_id}</p>
+            <p><b>Payment ID:</b> ${paymentId}</p>
+            <p><i>No se encontró una order asociada (orders) para esta reserva.</i></p>
+          </div>
+        `,
+      });
+
+      console.log("MP webhook: confirmado + email mínimo enviado", reservation_id);
+      return;
+    }
+
+    const o = orderRes.rows[0];
+    const items = Array.isArray(o.items) ? o.items : (o.items || []);
+
+    const itemsHtml = items
+      .map((it) => {
+        const sku = it.sku || "-";
+        const q = Number(it.quantity || 0);
+        const p = Number(it.unit_price || 0);
+        const sub = q * p;
+        return `<tr>
+          <td style="padding:6px;border-bottom:1px solid #eee">${sku}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee;text-align:center">${q}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee;text-align:right">$${p.toLocaleString("es-CL")}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee;text-align:right">$${sub.toLocaleString("es-CL")}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const delivery =
+      o.delivery_method === "retiro"
+        ? `<b>Retiro en Huillinco</b>`
+        : `<b>Envío por pagar</b><br/><b>Dirección:</b> ${o.delivery_address || "-"}`;
+
+    await sendStoreNotificationEmail({
+      to,
+      subject: "✅ Pago aprobado — Poleras Huillinco (Pedido listo)",
+      html: `
+        <div style="font-family:Arial,sans-serif">
+          <h2>✅ Pago aprobado — Pedido confirmado</h2>
+
+          <p><b>Reserva:</b> ${o.reservation_id}</p>
+          <p><b>Payment ID:</b> ${paymentId}</p>
+
+          <h3>Cliente</h3>
+          <p>
+            <b>Nombre:</b> ${o.buyer_name}<br/>
+            <b>Email:</b> ${o.buyer_email || "-"}<br/>
+            <b>Teléfono:</b> ${o.buyer_phone || "-"}
+          </p>
+
+          <h3>Entrega</h3>
+          <p>${delivery}</p>
+
+          <h3>Detalle</h3>
+          <table style="border-collapse:collapse;width:100%;max-width:640px">
+            <thead>
+              <tr>
+                <th style="text-align:left;padding:6px;border-bottom:2px solid #ddd">SKU</th>
+                <th style="text-align:center;padding:6px;border-bottom:2px solid #ddd">Cant</th>
+                <th style="text-align:right;padding:6px;border-bottom:2px solid #ddd">Precio</th>
+                <th style="text-align:right;padding:6px;border-bottom:2px solid #ddd">Subtotal</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itemsHtml}
+            </tbody>
+          </table>
+
+          <p style="margin-top:12px">
+            <b>Total:</b> $${Number(o.total_clp || 0).toLocaleString("es-CL")}
+          </p>
+
+          <p style="margin-top:14px">
+            Siguiente paso: contactar al cliente por WhatsApp para coordinar retiro/envío por pagar.
+          </p>
+        </div>
+      `,
+    });
+
+    console.log("MP webhook: confirmado + email completo enviado", reservation_id);
+  } catch (e) {
+    console.error("MP webhook error:", e);
   }
 });
 
