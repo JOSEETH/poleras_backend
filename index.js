@@ -504,6 +504,89 @@ app.put("/admin/variants/:id/stock", requireAdmin, async (req, res) => {
         requested: stock_total,
       });
     }
+// ===============================
+// ✅ ADMIN: DECREMENT STOCK_TOTAL (ventas presenciales / merma)
+// POST /admin/variants/:id/decrement
+// Body: { quantity: 1 }
+// ===============================
+app.post("/admin/variants/:id/decrement", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const qty = Number(req.body?.quantity);
+
+  if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+  if (!Number.isInteger(qty) || qty <= 0) {
+    return res.status(400).json({ ok: false, error: "invalid_quantity" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Opcional pero recomendado: limpiar expiradas antes de tocar stock
+    await cleanupExpiredReservations(client);
+
+    // Bloquear fila para evitar carreras
+    const cur = await client.query(
+      `SELECT id, stock_total, stock_reserved
+       FROM product_variants
+       WHERE id = $1
+       FOR UPDATE`,
+      [id]
+    );
+
+    if (!cur.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "variant_not_found" });
+    }
+
+    const stock_total = Number(cur.rows[0].stock_total || 0);
+    const stock_reserved = Number(cur.rows[0].stock_reserved || 0);
+
+    const new_total = stock_total - qty;
+
+    // No permitir negativo
+    if (new_total < 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        error: "insufficient_stock_total",
+        stock_total,
+        requested_decrement: qty,
+      });
+    }
+
+    // Regla crítica: stock_total jamás puede quedar bajo reserved
+    if (new_total < stock_reserved) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        error: "stock_total_below_reserved",
+        stock_total,
+        stock_reserved,
+        requested_decrement: qty,
+        would_be: new_total,
+      });
+    }
+
+    const up = await client.query(
+      `UPDATE product_variants
+       SET stock_total = $2
+       WHERE id = $1
+       RETURNING id, stock_total, stock_reserved, (stock_total - stock_reserved) AS stock_available`,
+      [id, new_total]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, variant: up.rows[0], decremented: qty });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("POST /admin/variants/:id/decrement error:", e);
+    return res.status(500).json({ ok: false, error: "admin_decrement_failed" });
+  } finally {
+    client.release();
+  }
+});
+
 
     const updated = await client.query(
       `
