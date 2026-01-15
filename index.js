@@ -244,7 +244,7 @@ app.post("/reserve", async (req, res) => {
 
       const r = await client.query(
         `
-        INSERT INTO stock_reservations (variant_id, qty, status, expires_at)
+        INSERT INTO stock_reservations (variant_id, quantity, status, expires_at)
         VALUES ($1, $2, 'active', $3)
         RETURNING id
         `,
