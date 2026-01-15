@@ -145,7 +145,7 @@ async function cleanupExpiredReservations() {
     await client.query("BEGIN");
     const exp = await client.query(
       `
-      SELECT id, variant_id, qty
+      SELECT id, variant_id, quantity
       FROM stock_reservations
       WHERE status = 'active' AND expires_at <= NOW()
       FOR UPDATE;
@@ -157,7 +157,7 @@ async function cleanupExpiredReservations() {
         `UPDATE product_variants
          SET stock_reserved = GREATEST(stock_reserved - $1, 0)
          WHERE id = $2`,
-        [r.qty, r.variant_id]
+        [r.quantity, r.variant_id]
       );
 
       await client.query(
@@ -881,7 +881,7 @@ app.post("/pay/create", async (req, res) => {
     const order = await getOrderForPayment(client, { order_id, reservation_id });
 
     if (!order) {
-      return res.status(404).json({ ok: false, error: "order_not_found" });
+      return res.status(404).json({ ok: false, error: "order_not_found", hint: "Primero crea la orden con POST /orders usando el reservation_id. Luego llama POST /pay/create con order_id." });
     }
 
     if (order.status !== "pending_payment") {
