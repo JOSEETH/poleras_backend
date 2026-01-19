@@ -284,7 +284,8 @@ app.post("/orders", async (req, res) => {
       buyer_phone,
       delivery_method, // 'retiro' | 'envio_por_pagar'
       delivery_address, // requerido si envio_por_pagar
-      items, // [{ sku, quantity, unit_price }]
+      items, // ✅ preferido: [{ variant_id, qty }]
+      // compat legado: [{ sku, quantity, unit_price }]
     } = req.body || {};
 
     if (!reservation_id) {
@@ -295,10 +296,6 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_buyer_data" });
     }
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: "missing_items" });
-    }
-
     if (!delivery_method || !["retiro", "envio_por_pagar"].includes(delivery_method)) {
       return res.status(400).json({ ok: false, error: "invalid_delivery_method" });
     }
@@ -307,20 +304,49 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_delivery_address" });
     }
 
-    const total = items.reduce((acc, it) => {
-      const q = Number(it.quantity || 0);
-      const p = Number(it.unit_price || 0);
-      return acc + q * p;
-    }, 0);
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, error: "missing_items" });
+    }
+
+    // Normalizar items: aceptar {variant_id, qty} o legado {sku, quantity, unit_price}
+    const normalized = items.map((it) => {
+      if (it && it.variant_id) {
+        return {
+          variant_id: it.variant_id,
+          qty: Number(it.qty),
+        };
+      }
+      // legado
+      return {
+        sku: it?.sku,
+        quantity: Number(it?.quantity || 0),
+        unit_price: Number(it?.unit_price || 0),
+      };
+    });
+
+    // Validación fuerte
+    for (const it of normalized) {
+      if (it.variant_id) {
+        if (!it.variant_id || !Number.isInteger(it.qty) || it.qty <= 0) {
+          return res.status(400).json({ ok: false, error: "invalid_item" });
+        }
+      } else {
+        if (!it.sku || !Number.isInteger(it.quantity) || it.quantity <= 0 || !Number.isFinite(it.unit_price) || it.unit_price < 0) {
+          return res.status(400).json({ ok: false, error: "invalid_item" });
+        }
+      }
+    }
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
+      // Validar reserva (la implementación actual usa reservation_id = id de stock_reservations)
       const r = await client.query(
-        `SELECT id, status, expires_at
+        `SELECT id, status, expires_at, variant_id, quantity
          FROM stock_reservations
-         WHERE id = $1`,
+         WHERE id = $1
+         FOR UPDATE`,
         [reservation_id]
       );
 
@@ -330,9 +356,64 @@ app.post("/orders", async (req, res) => {
       }
 
       const rs = r.rows[0];
-      if (rs.status !== "active" || new Date(rs.expires_at) <= new Date()) {
+      if (rs.status !== "active" || (rs.expires_at && new Date(rs.expires_at) <= new Date())) {
         await client.query("ROLLBACK");
         return res.status(409).json({ ok: false, error: "reservation_expired_or_not_active" });
+      }
+
+      // Si el request viene con variant_id/qty, exigimos consistencia con la reserva actual (single-item)
+      const reqVariantItems = normalized.filter((x) => x.variant_id);
+      if (reqVariantItems.length) {
+        if (reqVariantItems.length !== 1) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ ok: false, error: "multi_item_not_supported_with_single_reservation" });
+        }
+        const it = reqVariantItems[0];
+        if (String(it.variant_id) !== String(rs.variant_id) || Number(it.qty) !== Number(rs.quantity)) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            ok: false,
+            error: "reservation_items_mismatch",
+            reservation: { variant_id: rs.variant_id, qty: rs.quantity },
+            request: { variant_id: it.variant_id, qty: it.qty },
+          });
+        }
+      }
+
+      // Calcular total: si hay variant_id, usar price_clp desde product_variants.
+      let total = 0;
+      let storedItems = [];
+
+      if (reqVariantItems.length) {
+        const v = await client.query(
+          `SELECT id, sku, price_clp
+           FROM product_variants
+           WHERE id = $1`,
+          [rs.variant_id]
+        );
+        if (!v.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ ok: false, error: "variant_not_found" });
+        }
+        const pv = v.rows[0];
+        const unit = Number(pv.price_clp || 0);
+        total = unit * Number(rs.quantity);
+        storedItems = [
+          {
+            variant_id: pv.id,
+            sku: pv.sku,
+            quantity: Number(rs.quantity),
+            unit_price: unit,
+          },
+        ];
+      } else {
+        // legado
+        total = normalized.reduce((acc, it) => acc + Number(it.quantity) * Number(it.unit_price), 0);
+        storedItems = normalized.map((it) => ({
+          sku: it.sku,
+          quantity: Number(it.quantity),
+          unit_price: Number(it.unit_price),
+        }));
       }
 
       const ins = await client.query(
@@ -357,7 +438,7 @@ app.post("/orders", async (req, res) => {
           buyer_phone,
           delivery_method,
           delivery_address || null,
-          JSON.stringify(items),
+          JSON.stringify(storedItems),
           total,
         ]
       );
@@ -915,6 +996,172 @@ app.post("/pay/create", async (req, res) => {
     client.release();
   }
 });
+
+// ========================
+// ✅ MOCK: APROBAR PAGO (Opción 1)
+// - Simula pago aprobado
+// - Consume la reserva
+// - Descuenta stock definitivo
+// - Marca la orden como paid
+// ========================
+app.post("/pay/mock/approve", async (req, res) => {
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ ok: false, error: "missing_order_id" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1) Bloquear orden
+    const oq = await client.query(
+      `SELECT id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp
+         FROM orders
+        WHERE id = $1
+        FOR UPDATE`,
+      [order_id]
+    );
+
+    if (!oq.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "order_not_found" });
+    }
+
+    const order = oq.rows[0];
+
+    // idempotencia
+    if (order.status === "paid") {
+      await client.query("COMMIT");
+      return res.json({ ok: true, message: "order_already_paid", order_id });
+    }
+
+    if (order.status !== "pending_payment") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "order_not_pending_payment", status: order.status });
+    }
+
+    if (!order.reservation_id) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "order_missing_reservation_id" });
+    }
+
+    // 2) Bloquear reserva (en tu implementación actual: reservation_id = id de stock_reservations)
+    const rq = await client.query(
+      `SELECT id, variant_id, quantity, status, expires_at
+         FROM stock_reservations
+        WHERE id = $1
+        FOR UPDATE`,
+      [order.reservation_id]
+    );
+
+    if (!rq.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "reservation_not_found" });
+    }
+
+    const r = rq.rows[0];
+
+    if (r.status !== "active") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "reservation_not_active", status: r.status });
+    }
+
+    if (r.expires_at && new Date(r.expires_at) <= new Date()) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "reservation_expired" });
+    }
+
+    const qty = Number(r.quantity);
+    if (!Number.isInteger(qty) || qty <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ ok: false, error: "invalid_reservation_quantity" });
+    }
+
+    // 3) Descontar stock definitivo
+    const pv = await client.query(
+      `SELECT id, stock_total, stock_reserved
+         FROM product_variants
+        WHERE id = $1
+        FOR UPDATE`,
+      [r.variant_id]
+    );
+
+    if (!pv.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "variant_not_found" });
+    }
+
+    const row = pv.rows[0];
+    if (Number(row.stock_reserved) < qty) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "reserved_stock_insufficient", stock_reserved: row.stock_reserved, qty });
+    }
+    if (Number(row.stock_total) < qty) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "stock_total_insufficient", stock_total: row.stock_total, qty });
+    }
+
+    await client.query(
+      `UPDATE product_variants
+          SET stock_total = stock_total - $1,
+              stock_reserved = stock_reserved - $1
+        WHERE id = $2`,
+      [qty, r.variant_id]
+    );
+
+    // 4) Consumir reserva
+    await client.query(
+      `UPDATE stock_reservations
+          SET status = 'consumed'
+        WHERE id = $1`,
+      [r.id]
+    );
+
+    // 5) Marcar orden pagada
+    await client.query(
+      `UPDATE orders
+          SET status = 'paid',
+              paid_at = NOW()
+        WHERE id = $1`,
+      [order.id]
+    );
+
+    await client.query("COMMIT");
+
+    // 6) (Opcional) Email: no bloquea el response
+    try {
+      if (typeof sendStoreNotificationEmail === "function") {
+        await sendStoreNotificationEmail({
+          order_id: order.id,
+          buyer_name: order.buyer_name,
+          buyer_email: order.buyer_email,
+          buyer_phone: order.buyer_phone,
+          delivery_method: order.delivery_method,
+          delivery_address: order.delivery_address,
+          items: order.items,
+          total_clp: order.total_clp,
+        });
+      }
+    } catch (e) {
+      console.error("sendStoreNotificationEmail error:", e);
+    }
+
+    return res.json({
+      ok: true,
+      message: "mock_payment_approved",
+      order_id: order.id,
+      reservation_id: r.id,
+      variant_id: r.variant_id,
+      qty,
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("POST /pay/mock/approve error:", e);
+    return res.status(500).json({ ok: false, error: "mock_approve_failed" });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ========================
 // ✅ MERCADO PAGO (modo actual / stub)
