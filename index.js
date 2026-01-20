@@ -1070,81 +1070,70 @@ async function createMpPayment({ order }) {
   return { ok: true, provider: "mp", payment_url: initPoint, raw: mpRes?.body };
 }
 
-app.post("/pay/create", async (req, res) => {
-  const {
-    order_id,
-    reservation_id,
-    buyer_name,
-    buyer_email,
-    buyer_phone,
-    delivery_method,
-    delivery_address,
-    notes,
-  } = req.body || {};
-
-  if (!order_id && !reservation_id) {
-    return res.status(400).json({ ok: false, error: "missing_order_id_or_reservation_id" });
-  }
-
-  const client = await pool.connect();
+app.post('/pay/create', async (req, res) => {
   try {
-    await client.query("BEGIN");
+    const { order_id } = req.body;
 
-    const order = await getOrCreateOrderForPayment(client, {
-      order_id,
-      reservation_id,
-      buyer_name,
-      buyer_email,
-      buyer_phone,
-      delivery_method,
-      delivery_address,
-      notes,
+    if (!order_id) {
+      return res.status(400).json({ error: 'missing_order_id' });
+    }
+
+    // 1. Obtener orden
+    const oq = await pool.query(
+      `SELECT id, total_clp
+       FROM orders
+       WHERE id = $1`,
+      [order_id]
+    );
+
+    if (oq.rowCount === 0) {
+      return res.status(404).json({ error: 'order_not_found' });
+    }
+
+    const order = oq.rows[0];
+
+    // 2. Construir payload Getnet (TEST)
+    const payload = {
+      amount: order.total_clp,
+      currency: 'CLP',
+      orderId: order.id,
+      returnUrl: process.env.GETNET_RETURN_URL,
+      cancelUrl: process.env.GETNET_CANCEL_URL,
+      merchantId: process.env.GETNET_MERCHANT_ID,
+    };
+
+    // 3. Llamada Getnet
+    const response = await fetch(process.env.GETNET_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GETNET_API_KEY}`,
+      },
+      body: JSON.stringify(payload),
     });
 
-    if (!order) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        ok: false,
-        error: "order_not_found",
-        hint: "No se encontró la orden ni fue posible crearla desde la reserva. Verifica reservation_id.",
-      });
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Getnet error:', data);
+      return res.status(400).json({ error: 'pay_create_failed', detail: data });
     }
 
-    if (order.status !== "pending_payment") {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        ok: false,
-        error: "order_not_pending_payment",
-        status: order.status,
-      });
-    }
+    // 4. Guardar referencia Getnet
+    await pool.query(
+      `UPDATE orders
+       SET payment_ref = $1
+       WHERE id = $2`,
+      [data.reference || data.orderId, order.id]
+    );
 
-    const provider = (process.env.PAY_PROVIDER || "").toLowerCase() || "getnet";
-
-    let result;
-    if (provider === "getnet") result = await createGetnetPayment({ order, req });
-    else if (provider === "mp") result = await createMpPayment({ order });
-    else result = { ok: true, provider: "stub", payment_url: buildStubPaymentUrl(order.id) };
-
-    if (!result.ok) {
-      await client.query("ROLLBACK");
-      return res.status(502).json(result);
-    }
-
-    await client.query("COMMIT");
-    return res.json({
-      ok: true,
-      provider: result.provider,
-      payment_url: result.payment_url,
+    res.json({
+      redirect_url: data.redirectUrl,
     });
-  } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_) {}
-    console.error("POST /pay/create error:", e);
-    return res.status(500).json({ ok: false, error: "pay_create_failed" });
-  } finally {
-    client.release();
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
