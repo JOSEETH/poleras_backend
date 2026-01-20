@@ -1022,26 +1022,26 @@ app.post("/pay/mock/approve", async (req, res) => {
     );
 
     if (!oq.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "order_not_found" });
+      throw Object.assign(new Error("order_not_found"), { http: 404 });
     }
 
     const order = oq.rows[0];
 
-    // idempotencia
+    // idempotencia orden
     if (order.status === "paid") {
       await client.query("COMMIT");
       return res.json({ ok: true, message: "order_already_paid", order_id });
     }
 
     if (order.status !== "pending_payment") {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "order_not_pending_payment", status: order.status });
+      throw Object.assign(new Error("order_not_pending_payment"), {
+        http: 409,
+        extra: { status: order.status },
+      });
     }
 
     if (!order.reservation_id) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "order_missing_reservation_id" });
+      throw Object.assign(new Error("order_missing_reservation_id"), { http: 409 });
     }
 
     // 2) Bloquear reserva (en tu implementación actual: reservation_id = id de stock_reservations)
@@ -1054,26 +1054,38 @@ app.post("/pay/mock/approve", async (req, res) => {
     );
 
     if (!rq.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "reservation_not_found" });
+      throw Object.assign(new Error("reservation_not_found"), { http: 404 });
     }
 
     const r = rq.rows[0];
 
+    // idempotencia reserva: si ya está confirmada, cerramos la orden como paid y listo
+    if (r.status === "confirmed") {
+      await client.query(
+        `UPDATE orders
+            SET status = 'paid',
+                paid_at = NOW()
+          WHERE id = $1`,
+        [order.id]
+      );
+      await client.query("COMMIT");
+      return res.json({ ok: true, message: "reservation_already_confirmed_order_paid", order_id: order.id });
+    }
+
     if (r.status !== "active") {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "reservation_not_active", status: r.status });
+      throw Object.assign(new Error("reservation_not_active"), {
+        http: 409,
+        extra: { status: r.status },
+      });
     }
 
     if (r.expires_at && new Date(r.expires_at) <= new Date()) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "reservation_expired" });
+      throw Object.assign(new Error("reservation_expired"), { http: 409 });
     }
 
     const qty = Number(r.quantity);
     if (!Number.isInteger(qty) || qty <= 0) {
-      await client.query("ROLLBACK");
-      return res.status(500).json({ ok: false, error: "invalid_reservation_quantity" });
+      throw Object.assign(new Error("invalid_reservation_quantity"), { http: 500 });
     }
 
     // 3) Descontar stock definitivo
@@ -1086,18 +1098,24 @@ app.post("/pay/mock/approve", async (req, res) => {
     );
 
     if (!pv.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "variant_not_found" });
+      throw Object.assign(new Error("variant_not_found"), { http: 404 });
     }
 
     const row = pv.rows[0];
-    if (Number(row.stock_reserved) < qty) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "reserved_stock_insufficient", stock_reserved: row.stock_reserved, qty });
+    const stockReserved = Number(row.stock_reserved);
+    const stockTotal = Number(row.stock_total);
+
+    if (stockReserved < qty) {
+      throw Object.assign(new Error("reserved_stock_insufficient"), {
+        http: 409,
+        extra: { stock_reserved: row.stock_reserved, qty },
+      });
     }
-    if (Number(row.stock_total) < qty) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "stock_total_insufficient", stock_total: row.stock_total, qty });
+    if (stockTotal < qty) {
+      throw Object.assign(new Error("stock_total_insufficient"), {
+        http: 409,
+        extra: { stock_total: row.stock_total, qty },
+      });
     }
 
     await client.query(
@@ -1108,11 +1126,12 @@ app.post("/pay/mock/approve", async (req, res) => {
       [qty, r.variant_id]
     );
 
-    // 4) Consumir reserva
+    // 4) Confirmar reserva (NO 'consumed' porque tu constraint no lo permite)
     await client.query(
       `UPDATE stock_reservations
-          SET status = 'consumed'
-        WHERE id = $1`,
+          SET status = 'confirmed'
+        WHERE id = $1
+          AND status = 'active'`,
       [r.id]
     );
 
@@ -1154,9 +1173,16 @@ app.post("/pay/mock/approve", async (req, res) => {
       qty,
     });
   } catch (e) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+
+    const http = e.http || 500;
+    const extra = e.extra || undefined;
+    const code = e.message || "mock_approve_failed";
+
     console.error("POST /pay/mock/approve error:", e);
-    return res.status(500).json({ ok: false, error: "mock_approve_failed" });
+    return res.status(http).json({ ok: false, error: code, ...(extra ? { extra } : {}) });
   } finally {
     client.release();
   }
