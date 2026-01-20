@@ -198,8 +198,9 @@ app.post("/reserve", async (req, res) => {
 
     const out = [];
     for (const it of items) {
-      const variant_id = it.variant_id;
-      const qty = Number(it.qty);
+      const variant_id = it.variant_id || it.variantId || it.id || it.variant;
+      const qtyRaw = (it.qty ?? it.quantity ?? it.count ?? it.q);
+      const qty = Number(qtyRaw);
 
       if (!variant_id || !Number.isInteger(qty) || qty <= 0) {
         await client.query("ROLLBACK");
