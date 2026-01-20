@@ -1070,7 +1070,7 @@ async function createMpPayment({ order }) {
   return { ok: true, provider: "mp", payment_url: initPoint, raw: mpRes?.body };
 }
 
-import crypto from "crypto";
+const crypto = require("crypto");
 
 // Helpers Getnet (WebCheckout v2.3 - WSSE UsernameToken)
 function b64(buf) {
