@@ -1070,72 +1070,156 @@ async function createMpPayment({ order }) {
   return { ok: true, provider: "mp", payment_url: initPoint, raw: mpRes?.body };
 }
 
-app.post('/pay/create', async (req, res) => {
+import crypto from "crypto";
+
+// Helpers Getnet (WebCheckout v2.3 - WSSE UsernameToken)
+function b64(buf) {
+  return Buffer.from(buf).toString("base64");
+}
+
+function sha256(data) {
+  return crypto.createHash("sha256").update(data).digest();
+}
+
+/**
+ * PasswordDigest = Base64( SHA-256( nonce + seed + secretkey ) )
+ * nonce: bytes aleatorios (se envía base64)
+ * seed: ISO datetime string
+ */
+function buildGetnetAuth() {
+  const nonceBytes = crypto.randomBytes(16);
+  const seed = new Date().toISOString();
+  const secret = process.env.GETNET_SECRETKEY;
+
+  if (!process.env.GETNET_LOGIN || !secret) {
+    throw new Error("missing_getnet_credentials");
+  }
+
+  const digest = sha256(Buffer.concat([nonceBytes, Buffer.from(seed), Buffer.from(secret)]));
+  return {
+    login: process.env.GETNET_LOGIN,
+    tranKey: b64(digest),
+    nonce: b64(nonceBytes),
+    seed,
+  };
+}
+
+app.post("/pay/create", async (req, res) => {
   try {
     const { order_id } = req.body;
 
-    if (!order_id) {
-      return res.status(400).json({ error: 'missing_order_id' });
-    }
+    if (!order_id) return res.status(400).json({ error: "missing_order_id" });
 
-    // 1. Obtener orden
+    // 1) Obtener orden + items necesarios (ajusta campos si tu tabla tiene otros nombres)
     const oq = await pool.query(
-      `SELECT id, total_clp
+      `SELECT id, total_clp, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, notes, items
        FROM orders
        WHERE id = $1`,
       [order_id]
     );
 
-    if (oq.rowCount === 0) {
-      return res.status(404).json({ error: 'order_not_found' });
-    }
-
+    if (oq.rowCount === 0) return res.status(404).json({ error: "order_not_found" });
     const order = oq.rows[0];
 
-    // 2. Construir payload Getnet (TEST)
-    const payload = {
-      amount: order.total_clp,
-      currency: 'CLP',
-      orderId: order.id,
-      returnUrl: process.env.GETNET_RETURN_URL,
-      cancelUrl: process.env.GETNET_CANCEL_URL,
-      merchantId: process.env.GETNET_MERCHANT_ID,
-    };
-
-    // 3. Llamada Getnet
-    const response = await fetch(process.env.GETNET_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.GETNET_API_KEY}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('Getnet error:', data);
-      return res.status(400).json({ error: 'pay_create_failed', detail: data });
+    // items puede venir como JSON string o JSON
+    let items = [];
+    try {
+      items = Array.isArray(order.items) ? order.items : JSON.parse(order.items || "[]");
+    } catch {
+      items = [];
     }
 
-    // 4. Guardar referencia Getnet
+    // 2) Construir request Getnet (v2.3)
+    // OJO: evita caracteres reservados del manual en strings si puedes.
+    const auth = buildGetnetAuth();
+
+    const returnUrl = process.env.GETNET_RETURN_URL;
+    const cancelUrl = process.env.GETNET_CANCEL_URL;
+
+    if (!returnUrl || !cancelUrl) {
+      return res.status(500).json({ error: "missing_return_or_cancel_url" });
+    }
+
+    // Normaliza payer/buyer
+    const buyerEmail = (order.buyer_email || "").trim();
+    const buyerName = (order.buyer_name || "").trim() || "Cliente";
+    const buyerPhone = (order.buyer_phone || "").trim();
+
+    const getnetPayload = {
+      auth,
+      payment: {
+        reference: String(order.id),          // tu id interno como referencia
+        description: `Compra Polera Huillinco (${order.id})`,
+        amount: {
+          currency: "CLP",
+          total: Number(order.total_clp) || 0,
+        },
+        allowPartial: false,
+        items: (items || []).map((it) => ({
+          sku: String(it.sku || it.variant_id || ""),
+          name: String(it.grabado_nombre || it.name || "Producto"),
+          quantity: Number(it.quantity) || 1,
+          price: Number(it.unit_price_clp || it.price_clp || 0),
+        })),
+      },
+      payer: {
+        name: buyerName,
+        email: buyerEmail,
+        mobile: buyerPhone,
+        address: order.delivery_address ? { street: String(order.delivery_address) } : undefined,
+      },
+      // URLs de retorno
+      returnUrl,
+      cancelUrl,
+      locale: "es_CL",
+    };
+
+    const base = process.env.GETNET_BASE_URL; // ej: https://checkout.test.getnet.cl  (en test)
+    if (!base) return res.status(500).json({ error: "missing_getnet_base_url" });
+
+    const url = `${base.replace(/\/$/, "")}/api/session`;
+
+    // 3) Llamada a Getnet
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(getnetPayload),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      console.error("Getnet error:", response.status, data);
+      return res.status(400).json({ error: "pay_create_failed", detail: data });
+    }
+
+    // 4) Guardar requestId / processUrl
+    // En el manual suele venir: { requestId, processUrl, status: { ... } }
+    const requestId = data.requestId ? String(data.requestId) : null;
+    const processUrl = data.processUrl || null;
+
+    if (!processUrl || !requestId) {
+      console.error("Getnet response missing fields:", data);
+      return res.status(400).json({ error: "pay_create_failed", detail: data });
+    }
+
     await pool.query(
       `UPDATE orders
        SET payment_ref = $1
        WHERE id = $2`,
-      [data.reference || data.orderId, order.id]
+      [requestId, order.id]
     );
 
-    res.json({
-      redirect_url: data.redirectUrl,
+    return res.json({
+      request_id: requestId,
+      redirect_url: processUrl,
     });
-
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'internal_error' });
+    return res.status(500).json({ error: "internal_error" });
   }
 });
+
 
 // ========================
 // ✅ MERCADO PAGO (modo actual / stub)
