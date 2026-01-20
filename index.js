@@ -1178,14 +1178,34 @@ app.post("/pay/create", async (req, res) => {
     // 🔹 Reference Getnet válida (máx 32 chars, sin UUID)
 const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
 
-// 🔹 Obtener IP real del cliente
-const clientIp =
-  (req.headers["x-forwarded-for"] || "")
-    .toString()
-    .split(",")[0]
-    .trim() ||
-  req.socket?.remoteAddress ||
-  "127.0.0.1";
+// 🔹 Obtener IP IPv4 válida para Getnet
+function getClientIPv4(req) {
+  let ip =
+    (req.headers["x-forwarded-for"] || "")
+      .toString()
+      .split(",")[0]
+      .trim() ||
+    req.connection?.remoteAddress ||
+    req.socket?.remoteAddress ||
+    "";
+
+  // Eliminar prefijo IPv6 ::ffff:
+  if (ip.startsWith("::ffff:")) {
+    ip = ip.replace("::ffff:", "");
+  }
+
+  // Si sigue siendo IPv6 o inválida, fallback seguro
+  const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(\1|\d{1,3})\.(\1|\d{1,3})\.(\1|\d{1,3})$/;
+
+  if (!ipv4Regex.test(ip)) {
+    ip = "127.0.0.1";
+  }
+
+  return ip;
+}
+
+const clientIp = getClientIPv4(req);
+
 
     // 6️⃣ Payload OFICIAL Getnet (session)
     const getnetPayload = {
