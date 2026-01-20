@@ -359,7 +359,7 @@ app.post("/orders", async (req, res) => {
           delivery_method,
           delivery_address || null,
           JSON.stringify(items),
-          total: computedTotal,
+          total, computedTotal,
         ]
       );
 
@@ -855,7 +855,7 @@ async function getOrCreateOrderForPayment(client, {
         delivery_address || null,
         notes || null,
         JSON.stringify(items),
-        total: computedTotal,
+        total, computedTotal,
       ]
     );
   } catch (e) {
@@ -873,7 +873,7 @@ async function getOrCreateOrderForPayment(client, {
           delivery_method || null,
           delivery_address || null,
           JSON.stringify(items),
-          total: computedTotal,
+          total, computedTotal,
         ]
       );
     } else {
