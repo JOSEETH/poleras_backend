@@ -284,8 +284,7 @@ app.post("/orders", async (req, res) => {
       buyer_phone,
       delivery_method, // 'retiro' | 'envio_por_pagar'
       delivery_address, // requerido si envio_por_pagar
-      items, // ✅ preferido: [{ variant_id, qty }]
-      // compat legado: [{ sku, quantity, unit_price }]
+      items, // [{ sku, quantity, unit_price }]
     } = req.body || {};
 
     if (!reservation_id) {
@@ -296,6 +295,10 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_buyer_data" });
     }
 
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, error: "missing_items" });
+    }
+
     if (!delivery_method || !["retiro", "envio_por_pagar"].includes(delivery_method)) {
       return res.status(400).json({ ok: false, error: "invalid_delivery_method" });
     }
@@ -304,49 +307,20 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_delivery_address" });
     }
 
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: "missing_items" });
-    }
-
-    // Normalizar items: aceptar {variant_id, qty} o legado {sku, quantity, unit_price}
-    const normalized = items.map((it) => {
-      if (it && it.variant_id) {
-        return {
-          variant_id: it.variant_id,
-          qty: Number(it.qty),
-        };
-      }
-      // legado
-      return {
-        sku: it?.sku,
-        quantity: Number(it?.quantity || 0),
-        unit_price: Number(it?.unit_price || 0),
-      };
-    });
-
-    // Validación fuerte
-    for (const it of normalized) {
-      if (it.variant_id) {
-        if (!it.variant_id || !Number.isInteger(it.qty) || it.qty <= 0) {
-          return res.status(400).json({ ok: false, error: "invalid_item" });
-        }
-      } else {
-        if (!it.sku || !Number.isInteger(it.quantity) || it.quantity <= 0 || !Number.isFinite(it.unit_price) || it.unit_price < 0) {
-          return res.status(400).json({ ok: false, error: "invalid_item" });
-        }
-      }
-    }
+    const total = items.reduce((acc, it) => {
+      const q = Number(it.quantity || 0);
+      const p = Number(it.unit_price || 0);
+      return acc + q * p;
+    }, 0);
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // Validar reserva (la implementación actual usa reservation_id = id de stock_reservations)
       const r = await client.query(
-        `SELECT id, status, expires_at, variant_id, quantity
+        `SELECT id, status, expires_at
          FROM stock_reservations
-         WHERE id = $1
-         FOR UPDATE`,
+         WHERE id = $1`,
         [reservation_id]
       );
 
@@ -356,64 +330,9 @@ app.post("/orders", async (req, res) => {
       }
 
       const rs = r.rows[0];
-      if (rs.status !== "active" || (rs.expires_at && new Date(rs.expires_at) <= new Date())) {
+      if (rs.status !== "active" || new Date(rs.expires_at) <= new Date()) {
         await client.query("ROLLBACK");
         return res.status(409).json({ ok: false, error: "reservation_expired_or_not_active" });
-      }
-
-      // Si el request viene con variant_id/qty, exigimos consistencia con la reserva actual (single-item)
-      const reqVariantItems = normalized.filter((x) => x.variant_id);
-      if (reqVariantItems.length) {
-        if (reqVariantItems.length !== 1) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ ok: false, error: "multi_item_not_supported_with_single_reservation" });
-        }
-        const it = reqVariantItems[0];
-        if (String(it.variant_id) !== String(rs.variant_id) || Number(it.qty) !== Number(rs.quantity)) {
-          await client.query("ROLLBACK");
-          return res.status(409).json({
-            ok: false,
-            error: "reservation_items_mismatch",
-            reservation: { variant_id: rs.variant_id, qty: rs.quantity },
-            request: { variant_id: it.variant_id, qty: it.qty },
-          });
-        }
-      }
-
-      // Calcular total: si hay variant_id, usar price_clp desde product_variants.
-      let total = 0;
-      let storedItems = [];
-
-      if (reqVariantItems.length) {
-        const v = await client.query(
-          `SELECT id, sku, price_clp
-           FROM product_variants
-           WHERE id = $1`,
-          [rs.variant_id]
-        );
-        if (!v.rowCount) {
-          await client.query("ROLLBACK");
-          return res.status(404).json({ ok: false, error: "variant_not_found" });
-        }
-        const pv = v.rows[0];
-        const unit = Number(pv.price_clp || 0);
-        total = unit * Number(rs.quantity);
-        storedItems = [
-          {
-            variant_id: pv.id,
-            sku: pv.sku,
-            quantity: Number(rs.quantity),
-            unit_price: unit,
-          },
-        ];
-      } else {
-        // legado
-        total = normalized.reduce((acc, it) => acc + Number(it.quantity) * Number(it.unit_price), 0);
-        storedItems = normalized.map((it) => ({
-          sku: it.sku,
-          quantity: Number(it.quantity),
-          unit_price: Number(it.unit_price),
-        }));
       }
 
       const ins = await client.query(
@@ -438,7 +357,7 @@ app.post("/orders", async (req, res) => {
           buyer_phone,
           delivery_method,
           delivery_address || null,
-          JSON.stringify(storedItems),
+          JSON.stringify(items),
           total,
         ]
       );
@@ -844,6 +763,102 @@ async function getOrderForPayment(client, { order_id, reservation_id }) {
   return q.rowCount ? q.rows[0] : null;
 }
 
+// Si no existe orden aún (flujo del formulario actual), la creamos a partir de la reserva.
+// - Bloquea la reserva y la variante para consistencia.
+// - Calcula items y total_clp desde product_variants.
+async function getOrCreateOrderForPayment(client, {
+  order_id,
+  reservation_id,
+  buyer_name,
+  buyer_email,
+  buyer_phone,
+  delivery_method,
+  delivery_address,
+  notes,
+}) {
+  const existing = await getOrderForPayment(client, { order_id, reservation_id });
+  if (existing) return existing;
+
+  if (!reservation_id) return null;
+
+  // 1) Bloquear reserva
+  const rq = await client.query(
+    `SELECT id, variant_id, quantity, status, expires_at
+       FROM stock_reservations
+      WHERE id = $1
+      FOR UPDATE`,
+    [reservation_id]
+  );
+  if (!rq.rowCount) return null;
+  const r = rq.rows[0];
+
+  if (r.status !== "active") {
+    throw Object.assign(new Error("reservation_not_active"), { http: 409, code: "reservation_not_active", status: r.status });
+  }
+  if (r.expires_at && new Date(r.expires_at) <= new Date()) {
+    throw Object.assign(new Error("reservation_expired"), { http: 409, code: "reservation_expired" });
+  }
+
+  const qty = Number(r.quantity);
+  if (!Number.isInteger(qty) || qty <= 0) {
+    throw Object.assign(new Error("invalid_reservation_quantity"), { http: 500, code: "invalid_reservation_quantity" });
+  }
+
+  // 2) Bloquear variante y calcular total
+  const vq = await client.query(
+    `SELECT id, sku, color, size, grabado_codigo, grabado_nombre, price_clp, stock_total, stock_reserved
+       FROM product_variants
+      WHERE id = $1
+      FOR UPDATE`,
+    [r.variant_id]
+  );
+  if (!vq.rowCount) {
+    throw Object.assign(new Error("variant_not_found"), { http: 404, code: "variant_not_found" });
+  }
+  const v = vq.rows[0];
+
+  // Este flujo asume que /reserve ya incrementó stock_reserved.
+  if (Number(v.stock_reserved) < qty) {
+    throw Object.assign(new Error("reserved_stock_insufficient"), { http: 409, code: "reserved_stock_insufficient", stock_reserved: v.stock_reserved, qty });
+  }
+
+  const unit = Number(v.price_clp) || 0;
+  const total = unit * qty;
+  const items = [
+    {
+      variant_id: v.id,
+      sku: v.sku,
+      color: v.color,
+      size: v.size,
+      grabado_codigo: v.grabado_codigo,
+      grabado_nombre: v.grabado_nombre,
+      unit_price_clp: unit,
+      quantity: qty,
+      line_total_clp: total,
+    },
+  ];
+
+  // 3) Crear orden
+  const oq = await client.query(
+    `INSERT INTO orders (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, notes, items, total_clp)
+     VALUES ($1, 'pending_payment', $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+     RETURNING id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp, created_at`,
+    [
+      reservation_id,
+      buyer_name || null,
+      buyer_email || null,
+      buyer_phone || null,
+      delivery_method || null,
+      delivery_address || null,
+      notes || null,
+      JSON.stringify(items),
+      total,
+    ]
+  );
+
+  return oq.rows[0];
+}
+
 // 🟡 STUB universal (sirve para probar el flujo sin pasarela)
 function buildStubPaymentUrl(orderId) {
   const base = process.env.STUB_PAY_URL || "https://example.com/pay-stub";
@@ -951,7 +966,16 @@ async function createMpPayment({ order }) {
 }
 
 app.post("/pay/create", async (req, res) => {
-  const { order_id, reservation_id } = req.body || {};
+  const {
+    order_id,
+    reservation_id,
+    buyer_name,
+    buyer_email,
+    buyer_phone,
+    delivery_method,
+    delivery_address,
+    notes,
+  } = req.body || {};
 
   if (!order_id && !reservation_id) {
     return res.status(400).json({ ok: false, error: "missing_order_id_or_reservation_id" });
@@ -959,13 +983,30 @@ app.post("/pay/create", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const order = await getOrderForPayment(client, { order_id, reservation_id });
+    await client.query("BEGIN");
+
+    const order = await getOrCreateOrderForPayment(client, {
+      order_id,
+      reservation_id,
+      buyer_name,
+      buyer_email,
+      buyer_phone,
+      delivery_method,
+      delivery_address,
+      notes,
+    });
 
     if (!order) {
-      return res.status(404).json({ ok: false, error: "order_not_found", hint: "Primero crea la orden con POST /orders usando el reservation_id. Luego llama POST /pay/create con order_id." });
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        ok: false,
+        error: "order_not_found",
+        hint: "No se encontró la orden ni fue posible crearla desde la reserva. Verifica reservation_id.",
+      });
     }
 
     if (order.status !== "pending_payment") {
+      await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
         error: "order_not_pending_payment",
@@ -981,213 +1022,26 @@ app.post("/pay/create", async (req, res) => {
     else result = { ok: true, provider: "stub", payment_url: buildStubPaymentUrl(order.id) };
 
     if (!result.ok) {
+      await client.query("ROLLBACK");
       return res.status(502).json(result);
     }
 
+    await client.query("COMMIT");
     return res.json({
       ok: true,
       provider: result.provider,
       payment_url: result.payment_url,
     });
   } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
     console.error("POST /pay/create error:", e);
     return res.status(500).json({ ok: false, error: "pay_create_failed" });
   } finally {
     client.release();
   }
 });
-
-// ========================
-// ✅ MOCK: APROBAR PAGO (Opción 1)
-// - Simula pago aprobado
-// - Consume la reserva
-// - Descuenta stock definitivo
-// - Marca la orden como paid
-// ========================
-app.post("/pay/mock/approve", async (req, res) => {
-  const { order_id } = req.body || {};
-  if (!order_id) return res.status(400).json({ ok: false, error: "missing_order_id" });
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    // 1) Bloquear orden
-    const oq = await client.query(
-      `SELECT id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp
-         FROM orders
-        WHERE id = $1
-        FOR UPDATE`,
-      [order_id]
-    );
-
-    if (!oq.rowCount) {
-      throw Object.assign(new Error("order_not_found"), { http: 404 });
-    }
-
-    const order = oq.rows[0];
-
-    // idempotencia orden
-    if (order.status === "paid") {
-      await client.query("COMMIT");
-      return res.json({ ok: true, message: "order_already_paid", order_id });
-    }
-
-    if (order.status !== "pending_payment") {
-      throw Object.assign(new Error("order_not_pending_payment"), {
-        http: 409,
-        extra: { status: order.status },
-      });
-    }
-
-    if (!order.reservation_id) {
-      throw Object.assign(new Error("order_missing_reservation_id"), { http: 409 });
-    }
-
-    // 2) Bloquear reserva (en tu implementación actual: reservation_id = id de stock_reservations)
-    const rq = await client.query(
-      `SELECT id, variant_id, quantity, status, expires_at
-         FROM stock_reservations
-        WHERE id = $1
-        FOR UPDATE`,
-      [order.reservation_id]
-    );
-
-    if (!rq.rowCount) {
-      throw Object.assign(new Error("reservation_not_found"), { http: 404 });
-    }
-
-    const r = rq.rows[0];
-
-    // idempotencia reserva: si ya está confirmada, cerramos la orden como paid y listo
-    if (r.status === "confirmed") {
-      await client.query(
-        `UPDATE orders
-            SET status = 'paid',
-                paid_at = NOW()
-          WHERE id = $1`,
-        [order.id]
-      );
-      await client.query("COMMIT");
-      return res.json({ ok: true, message: "reservation_already_confirmed_order_paid", order_id: order.id });
-    }
-
-    if (r.status !== "active") {
-      throw Object.assign(new Error("reservation_not_active"), {
-        http: 409,
-        extra: { status: r.status },
-      });
-    }
-
-    if (r.expires_at && new Date(r.expires_at) <= new Date()) {
-      throw Object.assign(new Error("reservation_expired"), { http: 409 });
-    }
-
-    const qty = Number(r.quantity);
-    if (!Number.isInteger(qty) || qty <= 0) {
-      throw Object.assign(new Error("invalid_reservation_quantity"), { http: 500 });
-    }
-
-    // 3) Descontar stock definitivo
-    const pv = await client.query(
-      `SELECT id, stock_total, stock_reserved
-         FROM product_variants
-        WHERE id = $1
-        FOR UPDATE`,
-      [r.variant_id]
-    );
-
-    if (!pv.rowCount) {
-      throw Object.assign(new Error("variant_not_found"), { http: 404 });
-    }
-
-    const row = pv.rows[0];
-    const stockReserved = Number(row.stock_reserved);
-    const stockTotal = Number(row.stock_total);
-
-    if (stockReserved < qty) {
-      throw Object.assign(new Error("reserved_stock_insufficient"), {
-        http: 409,
-        extra: { stock_reserved: row.stock_reserved, qty },
-      });
-    }
-    if (stockTotal < qty) {
-      throw Object.assign(new Error("stock_total_insufficient"), {
-        http: 409,
-        extra: { stock_total: row.stock_total, qty },
-      });
-    }
-
-    await client.query(
-      `UPDATE product_variants
-          SET stock_total = stock_total - $1,
-              stock_reserved = stock_reserved - $1
-        WHERE id = $2`,
-      [qty, r.variant_id]
-    );
-
-    // 4) Confirmar reserva (NO 'consumed' porque tu constraint no lo permite)
-    await client.query(
-      `UPDATE stock_reservations
-          SET status = 'confirmed'
-        WHERE id = $1
-          AND status = 'active'`,
-      [r.id]
-    );
-
-    // 5) Marcar orden pagada
-    await client.query(
-      `UPDATE orders
-          SET status = 'paid',
-              paid_at = NOW()
-        WHERE id = $1`,
-      [order.id]
-    );
-
-    await client.query("COMMIT");
-
-    // 6) (Opcional) Email: no bloquea el response
-    try {
-      if (typeof sendStoreNotificationEmail === "function") {
-        await sendStoreNotificationEmail({
-          order_id: order.id,
-          buyer_name: order.buyer_name,
-          buyer_email: order.buyer_email,
-          buyer_phone: order.buyer_phone,
-          delivery_method: order.delivery_method,
-          delivery_address: order.delivery_address,
-          items: order.items,
-          total_clp: order.total_clp,
-        });
-      }
-    } catch (e) {
-      console.error("sendStoreNotificationEmail error:", e);
-    }
-
-    return res.json({
-      ok: true,
-      message: "mock_payment_approved",
-      order_id: order.id,
-      reservation_id: r.id,
-      variant_id: r.variant_id,
-      qty,
-    });
-  } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_) {}
-
-    const http = e.http || 500;
-    const extra = e.extra || undefined;
-    const code = e.message || "mock_approve_failed";
-
-    console.error("POST /pay/mock/approve error:", e);
-    return res.status(http).json({ ok: false, error: code, ...(extra ? { extra } : {}) });
-  } finally {
-    client.release();
-  }
-});
-
 
 // ========================
 // ✅ MERCADO PAGO (modo actual / stub)
@@ -1245,82 +1099,159 @@ app.post("/mp/webhook", async (req, res) => {
   }
 });
 
-app.post("/reservations/cleanup", async (req, res) => {
-  const { limit } = req.body || {};
-  const hardLimit = Number.isInteger(Number(limit)) ? Math.max(1, Math.min(500, Number(limit))) : 200;
+// ===============================
+// Getnet Web Checkout - URL de notificación
+// Usa esta URL en el formulario de validación.
+// Ej: https://poleras-backend.onrender.com/webhooks/getnet
+// ===============================
+app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
+  // Getnet puede enviar JSON u otros formatos. Nosotros aceptamos y respondemos 200 rápido.
+  const payload = req.body || {};
 
+  // Intenta extraer un identificador de orden desde distintos campos posibles.
+  const maybeOrderId =
+    payload.order_id ||
+    payload.orderId ||
+    payload.buyOrder ||
+    payload.buy_order ||
+    payload.reference ||
+    payload.external_reference ||
+    payload.externalReference ||
+    (payload.data && (payload.data.order_id || payload.data.orderId || payload.data.buyOrder)) ||
+    null;
+
+  // Siempre responde 200 para que Getnet no reintente sin fin.
+  res.status(200).json({ ok: true });
+
+  // Si no viene order_id, dejamos log y salimos.
+  if (!maybeOrderId) {
+    console.log("[getnet webhook] payload received (no order id)");
+    return;
+  }
+
+  // Procesa en segundo plano (no bloquea el response)
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 1) Tomar reservas vencidas activas (bloqueo para evitar carreras)
+    const oq = await client.query(
+      `SELECT id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp
+         FROM orders
+        WHERE id = $1
+        FOR UPDATE`,
+      [maybeOrderId]
+    );
+
+    if (!oq.rowCount) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] order not found:", maybeOrderId);
+      return;
+    }
+
+    const order = oq.rows[0];
+
+    // Idempotencia
+    if (order.status === "paid") {
+      await client.query("COMMIT");
+      return;
+    }
+
+    if (order.status !== "pending_payment") {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] order not pending_payment:", order.id, order.status);
+      return;
+    }
+
+    if (!order.reservation_id) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] missing reservation_id in order:", order.id);
+      return;
+    }
+
     const rq = await client.query(
-      `
-      SELECT id, variant_id, quantity
-      FROM public.stock_reservations
-      WHERE status = 'active'
-        AND expires_at IS NOT NULL
-        AND expires_at < NOW()
-      ORDER BY expires_at ASC
-      LIMIT $1
-      FOR UPDATE
-      `,
-      [hardLimit]
+      `SELECT id, variant_id, quantity, status, expires_at
+         FROM stock_reservations
+        WHERE id = $1
+        FOR UPDATE`,
+      [order.reservation_id]
     );
 
     if (!rq.rowCount) {
-      await client.query("COMMIT");
-      return res.json({ ok: true, expired: 0, updated_variants: 0 });
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] reservation not found:", order.reservation_id);
+      return;
     }
 
-    const reservations = rq.rows;
-
-    // 2) Agrupar por variant_id para ajustar stock_reserved en bloque
-    const byVariant = new Map();
-    for (const r of reservations) {
-      const qty = Number(r.quantity);
-      if (!Number.isInteger(qty) || qty <= 0) continue;
-      byVariant.set(r.variant_id, (byVariant.get(r.variant_id) || 0) + qty);
+    const r = rq.rows[0];
+    if (r.status !== "active") {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] reservation not active:", r.id, r.status);
+      return;
     }
 
-    // 3) Marcar reservas como expired (solo las que siguen active)
-    const ids = reservations.map(r => r.id);
-    await client.query(
-      `
-      UPDATE public.stock_reservations
-      SET status = 'expired'
-      WHERE id = ANY($1::uuid[])
-        AND status = 'active'
-      `,
-      [ids]
+    if (r.expires_at && new Date(r.expires_at) <= new Date()) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] reservation expired:", r.id);
+      return;
+    }
+
+    const qty = Number(r.quantity);
+    if (!Number.isInteger(qty) || qty <= 0) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] invalid quantity:", r.id, r.quantity);
+      return;
+    }
+
+    const pv = await client.query(
+      `SELECT id, stock_total, stock_reserved
+         FROM product_variants
+        WHERE id = $1
+        FOR UPDATE`,
+      [r.variant_id]
     );
 
-    // 4) Liberar stock_reserved por variante (evitar negativos con GREATEST)
-    let updatedVariants = 0;
-    for (const [variantId, sumQty] of byVariant.entries()) {
-      const up = await client.query(
-        `
-        UPDATE public.product_variants
-        SET stock_reserved = GREATEST(stock_reserved - $1, 0)
-        WHERE id = $2
-        `,
-        [sumQty, variantId]
-      );
-      updatedVariants += up.rowCount;
+    if (!pv.rowCount) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] variant not found:", r.variant_id);
+      return;
     }
 
-    await client.query("COMMIT");
+    const row = pv.rows[0];
+    if (Number(row.stock_reserved) < qty || Number(row.stock_total) < qty) {
+      await client.query("ROLLBACK");
+      console.log("[getnet webhook] stock insufficient:", r.variant_id, { row, qty });
+      return;
+    }
 
-    return res.json({
-      ok: true,
-      expired: reservations.length,
-      updated_variants: updatedVariants,
-      reservation_ids: ids,
-    });
+    await client.query(
+      `UPDATE product_variants
+          SET stock_total = stock_total - $1,
+              stock_reserved = stock_reserved - $1
+        WHERE id = $2`,
+      [qty, r.variant_id]
+    );
+
+    await client.query(
+      `UPDATE stock_reservations
+          SET status = 'consumed'
+        WHERE id = $1`,
+      [r.id]
+    );
+
+    await client.query(
+      `UPDATE orders
+          SET status = 'paid',
+              paid_at = NOW()
+        WHERE id = $1`,
+      [order.id]
+    );
+
+    await client.query("COMMIT");
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch (_) {}
-    console.error("POST /reservations/cleanup error:", e);
-    return res.status(500).json({ ok: false, error: "cleanup_failed" });
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("[getnet webhook] error:", e);
   } finally {
     client.release();
   }
@@ -1331,74 +1262,3 @@ app.post("/reservations/cleanup", async (req, res) => {
 // ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API running on port " + PORT));
-
-const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 120000); // 2 min default
-
-async function runExpiredReservationsCleanup() {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const rq = await client.query(
-      `
-      SELECT id, variant_id, quantity
-      FROM public.stock_reservations
-      WHERE status = 'active'
-        AND expires_at IS NOT NULL
-        AND expires_at < NOW()
-      ORDER BY expires_at ASC
-      LIMIT 200
-      FOR UPDATE
-      `
-    );
-
-    if (!rq.rowCount) {
-      await client.query("COMMIT");
-      return;
-    }
-
-    const reservations = rq.rows;
-    const ids = reservations.map(r => r.id);
-
-    const byVariant = new Map();
-    for (const r of reservations) {
-      const qty = Number(r.quantity);
-      if (!Number.isInteger(qty) || qty <= 0) continue;
-      byVariant.set(r.variant_id, (byVariant.get(r.variant_id) || 0) + qty);
-    }
-
-    await client.query(
-      `
-      UPDATE public.stock_reservations
-      SET status = 'expired'
-      WHERE id = ANY($1::uuid[])
-        AND status = 'active'
-      `,
-      [ids]
-    );
-
-    for (const [variantId, sumQty] of byVariant.entries()) {
-      await client.query(
-        `
-        UPDATE public.product_variants
-        SET stock_reserved = GREATEST(stock_reserved - $1, 0)
-        WHERE id = $2
-        `,
-        [sumQty, variantId]
-      );
-    }
-
-    await client.query("COMMIT");
-    console.log(`[cleanup] expired ${reservations.length} reservations`);
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch (_) {}
-    console.error("[cleanup] error:", e);
-  } finally {
-    client.release();
-  }
-}
-
-if (CLEANUP_INTERVAL_MS > 0) {
-  setInterval(runExpiredReservationsCleanup, CLEANUP_INTERVAL_MS);
-  console.log(`[cleanup] interval enabled: ${CLEANUP_INTERVAL_MS}ms`);
-}
