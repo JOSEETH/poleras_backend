@@ -1245,8 +1245,160 @@ app.post("/mp/webhook", async (req, res) => {
   }
 });
 
+app.post("/reservations/cleanup", async (req, res) => {
+  const { limit } = req.body || {};
+  const hardLimit = Number.isInteger(Number(limit)) ? Math.max(1, Math.min(500, Number(limit))) : 200;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1) Tomar reservas vencidas activas (bloqueo para evitar carreras)
+    const rq = await client.query(
+      `
+      SELECT id, variant_id, quantity
+      FROM public.stock_reservations
+      WHERE status = 'active'
+        AND expires_at IS NOT NULL
+        AND expires_at < NOW()
+      ORDER BY expires_at ASC
+      LIMIT $1
+      FOR UPDATE
+      `,
+      [hardLimit]
+    );
+
+    if (!rq.rowCount) {
+      await client.query("COMMIT");
+      return res.json({ ok: true, expired: 0, updated_variants: 0 });
+    }
+
+    const reservations = rq.rows;
+
+    // 2) Agrupar por variant_id para ajustar stock_reserved en bloque
+    const byVariant = new Map();
+    for (const r of reservations) {
+      const qty = Number(r.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) continue;
+      byVariant.set(r.variant_id, (byVariant.get(r.variant_id) || 0) + qty);
+    }
+
+    // 3) Marcar reservas como expired (solo las que siguen active)
+    const ids = reservations.map(r => r.id);
+    await client.query(
+      `
+      UPDATE public.stock_reservations
+      SET status = 'expired'
+      WHERE id = ANY($1::uuid[])
+        AND status = 'active'
+      `,
+      [ids]
+    );
+
+    // 4) Liberar stock_reserved por variante (evitar negativos con GREATEST)
+    let updatedVariants = 0;
+    for (const [variantId, sumQty] of byVariant.entries()) {
+      const up = await client.query(
+        `
+        UPDATE public.product_variants
+        SET stock_reserved = GREATEST(stock_reserved - $1, 0)
+        WHERE id = $2
+        `,
+        [sumQty, variantId]
+      );
+      updatedVariants += up.rowCount;
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      expired: reservations.length,
+      updated_variants: updatedVariants,
+      reservation_ids: ids,
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("POST /reservations/cleanup error:", e);
+    return res.status(500).json({ ok: false, error: "cleanup_failed" });
+  } finally {
+    client.release();
+  }
+});
+
 // ===============================
 // ✅ START
 // ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ API running on port " + PORT));
+
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS || 120000); // 2 min default
+
+async function runExpiredReservationsCleanup() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const rq = await client.query(
+      `
+      SELECT id, variant_id, quantity
+      FROM public.stock_reservations
+      WHERE status = 'active'
+        AND expires_at IS NOT NULL
+        AND expires_at < NOW()
+      ORDER BY expires_at ASC
+      LIMIT 200
+      FOR UPDATE
+      `
+    );
+
+    if (!rq.rowCount) {
+      await client.query("COMMIT");
+      return;
+    }
+
+    const reservations = rq.rows;
+    const ids = reservations.map(r => r.id);
+
+    const byVariant = new Map();
+    for (const r of reservations) {
+      const qty = Number(r.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) continue;
+      byVariant.set(r.variant_id, (byVariant.get(r.variant_id) || 0) + qty);
+    }
+
+    await client.query(
+      `
+      UPDATE public.stock_reservations
+      SET status = 'expired'
+      WHERE id = ANY($1::uuid[])
+        AND status = 'active'
+      `,
+      [ids]
+    );
+
+    for (const [variantId, sumQty] of byVariant.entries()) {
+      await client.query(
+        `
+        UPDATE public.product_variants
+        SET stock_reserved = GREATEST(stock_reserved - $1, 0)
+        WHERE id = $2
+        `,
+        [sumQty, variantId]
+      );
+    }
+
+    await client.query("COMMIT");
+    console.log(`[cleanup] expired ${reservations.length} reservations`);
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("[cleanup] error:", e);
+  } finally {
+    client.release();
+  }
+}
+
+if (CLEANUP_INTERVAL_MS > 0) {
+  setInterval(runExpiredReservationsCleanup, CLEANUP_INTERVAL_MS);
+  console.log(`[cleanup] interval enabled: ${CLEANUP_INTERVAL_MS}ms`);
+}
