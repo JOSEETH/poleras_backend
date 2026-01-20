@@ -11,6 +11,7 @@ require("dotenv").config();
 
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 
 const mercadopago = require("mercadopago");
 
@@ -198,9 +199,8 @@ app.post("/reserve", async (req, res) => {
 
     const out = [];
     for (const it of items) {
-      const variant_id = it.variant_id || it.variantId || it.id || it.variant;
-      const qtyRaw = (it.qty ?? it.quantity ?? it.count ?? it.q);
-      const qty = Number(qtyRaw);
+      const variant_id = it.variant_id;
+      const qty = Number(it.qty);
 
       if (!variant_id || !Number.isInteger(qty) || qty <= 0) {
         await client.query("ROLLBACK");
@@ -840,22 +840,46 @@ async function getOrCreateOrderForPayment(client, {
   ];
 
   // 3) Crear orden
-  const oq = await client.query(
-    `INSERT INTO orders (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, notes, items, total_clp)
-     VALUES ($1, 'pending_payment', $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
-     RETURNING id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp, created_at`,
-    [
-      reservation_id,
-      buyer_name || null,
-      buyer_email || null,
-      buyer_phone || null,
-      delivery_method || null,
-      delivery_address || null,
-      notes || null,
-      JSON.stringify(items),
-      total,
-    ]
-  );
+  let oq;
+  try {
+    oq = await client.query(
+      `INSERT INTO orders (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, notes, items, total_clp)
+       VALUES ($1, 'pending_payment', $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+       RETURNING id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp, created_at`,
+      [
+        reservation_id,
+        buyer_name || null,
+        buyer_email || null,
+        buyer_phone || null,
+        delivery_method || null,
+        delivery_address || null,
+        notes || null,
+        JSON.stringify(items),
+        total,
+      ]
+    );
+  } catch (e) {
+    // Si la tabla orders no tiene columna notes (error 42703), reintenta sin notes
+    if (e && (e.code === '42703' || String(e.message || '').includes('column \"notes\"'))) {
+      oq = await client.query(
+        `INSERT INTO orders (reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp)
+         VALUES ($1, 'pending_payment', $2, $3, $4, $5, $6, $7::jsonb, $8)
+         RETURNING id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp, created_at`,
+        [
+          reservation_id,
+          buyer_name || null,
+          buyer_email || null,
+          buyer_phone || null,
+          delivery_method || null,
+          delivery_address || null,
+          JSON.stringify(items),
+          total,
+        ]
+      );
+    } else {
+      throw e;
+    }
+  }
 
   return oq.rows[0];
 }
@@ -867,62 +891,128 @@ function buildStubPaymentUrl(orderId) {
 }
 
 // 🟢 Getnet (skeleton): aquí se enchufa la API real cuando te entreguen API Key
-async function createGetnetPayment({ order }) {
-  const hasKey =
-    !!process.env.GETNET_API_KEY && process.env.GETNET_API_KEY !== "PENDIENTE_CLIENTE";
+async function createGetnetPayment({ order, req }) {
+  // Getnet Web Checkout TEST/PROD usa auth con login/secretKey (tranKey) + nonce + seed.
+  // Manual: tranKey = Base64(SHA-256(nonce + seed + secretKey))
+  const baseUrl = (process.env.GETNET_BASE_URL || process.env.GETNET_API_BASE || '').replace(/\/$/, '');
+  const login = process.env.GETNET_LOGIN;
+  const secretKey = process.env.GETNET_SECRETKEY;
 
-  if (!hasKey) {
-    return { ok: true, provider: "getnet_stub", payment_url: buildStubPaymentUrl(order.id) };
-  }
-
-  const base = process.env.GETNET_API_BASE;
-  const path = process.env.GETNET_CREATE_PATH;
-
-  if (!base || !path) {
+  if (!baseUrl || !login || !secretKey) {
+    // Si no están configuradas las credenciales TEST/PROD, devolvemos stub (para no romper el sitio)
     return {
       ok: true,
-      provider: "getnet_stub_missing_base",
+      provider: "getnet_stub",
       payment_url: buildStubPaymentUrl(order.id),
-      warning: "Faltan GETNET_API_BASE / GETNET_CREATE_PATH",
+      warning: "Faltan GETNET_BASE_URL/GETNET_LOGIN/GETNET_SECRETKEY en variables de entorno",
     };
   }
 
-  const payload = {
-    commerce_code: process.env.GETNET_COMMERCE_CODE,
-    order_id: String(order.id),
-    amount: Number(order.total_clp || 0),
-    currency: "CLP",
-    customer: {
-      name: order.buyer_name || "",
-      email: order.buyer_email || "",
-      phone: order.buyer_phone || "",
-    },
-    return_url: process.env.GETNET_RETURN_URL,
-    notify_url: process.env.GETNET_NOTIFY_URL,
+  const now = new Date();
+  // Seed en ISO8601 con zona (Node lo entrega con Z, es válido)
+  const seed = now.toISOString();
+
+  const nonceRaw = crypto.randomBytes(16);
+  const nonceB64 = nonceRaw.toString('base64');
+
+  // sha256(nonce + seed + secretKey) donde nonce es RAW (no base64) según manual
+  const sha = crypto
+    .createHash('sha256')
+    .update(Buffer.concat([nonceRaw, Buffer.from(seed, 'utf8'), Buffer.from(secretKey, 'utf8')]))
+    .digest();
+  const tranKey = sha.toString('base64');
+
+  const auth = {
+    login,
+    tranKey,
+    nonce: nonceB64,
+    seed,
   };
 
-  const url = base.replace(/\/$/, "") + path;
+  // Datos requeridos por CreateRequest
+  const ipAddress =
+    (req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req?.socket?.remoteAddress ||
+    req?.ip ||
+    "127.0.0.1";
+
+  const userAgent = req?.headers?.['user-agent'] || "Mozilla/5.0";
+
+  // Importante: Getnet exige referencia ÚNICA por transacción.
+  // Usamos order.id + timestamp para evitar colisiones por reintentos.
+  const reference = `ORD-${order.id}-${Date.now()}`;
+
+  const total = Number(order.total_clp || 0);
+  if (!Number.isFinite(total) || total <= 0) {
+    return { ok: false, provider: "getnet", error: "invalid_total" };
+  }
+
+  const returnUrl = process.env.GETNET_RETURN_URL || process.env.GETNET_RETURN || process.env.RETURN_URL;
+  if (!returnUrl) {
+    return {
+      ok: false,
+      provider: "getnet",
+      error: "missing_return_url",
+      hint: "Configura GETNET_RETURN_URL (ej: https://cerveceriahuillinco.cl/pago)",
+    };
+  }
+
+  // Expiración: recomendamos 15 min desde ahora (o usa variable)
+  const ttlMin = Number(process.env.GETNET_SESSION_TTL_MINUTES || 15);
+  const expiration = new Date(Date.now() + ttlMin * 60 * 1000).toISOString();
+
+  // Buyer (opcional). El manual usa document/docType, acá mandamos lo mínimo.
+  const buyer = {
+    name: (order.buyer_name || "").split(" ")[0] || order.buyer_name || "",
+    surname: (order.buyer_name || "").split(" ").slice(1).join(" ") || "",
+    email: order.buyer_email || "",
+    mobile: order.buyer_phone || "",
+  };
+
+  const payload = {
+    auth,
+    locale: "es_CL",
+    buyer,
+    payment: {
+      reference,
+      description: `Compra Polera Huillinco (orden ${order.id})`,
+      amount: {
+        currency: "CLP",
+        total,
+      },
+    },
+    expiration,
+    ipAddress,
+    returnUrl,
+    userAgent,
+    // Opcionales útiles:
+    // skipResult: true,
+    // noBuyerFill: false,
+  };
+
+  const url = `${baseUrl}/api/session/`;
+
   const resp = await httpsJsonRequest(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.GETNET_API_KEY}`,
-    },
     body: payload,
   });
 
+  // Respuesta esperada: { status: { status: 'OK' }, requestId, processUrl }
   if (resp.status >= 200 && resp.status < 300) {
-    const paymentUrl =
-      resp.json?.payment_url || resp.json?.redirect_url || resp.json?.url || null;
+    const processUrl = resp.json?.processUrl || resp.json?.process_url || null;
+    const status = resp.json?.status?.status || resp.json?.status?.[0]?.status || null;
 
-    if (!paymentUrl) {
-      return {
-        ok: false,
-        provider: "getnet",
-        error: "getnet_missing_payment_url_in_response",
-        raw: resp.json,
-      };
+    if (!processUrl) {
+      return { ok: false, provider: "getnet", error: "missing_processUrl", raw: resp.json };
     }
-    return { ok: true, provider: "getnet", payment_url: paymentUrl, raw: resp.json };
+
+    // Si viene status y no es OK, lo tratamos como error
+    if (status && String(status).toUpperCase() !== 'OK') {
+      const msg = resp.json?.status?.message || resp.json?.status?.[0]?.message || 'getnet_status_not_ok';
+      return { ok: false, provider: "getnet", error: "getnet_status_not_ok", message: msg, raw: resp.json };
+    }
+
+    return { ok: true, provider: "getnet", payment_url: processUrl, raw: resp.json };
   }
 
   return {
@@ -1018,7 +1108,7 @@ app.post("/pay/create", async (req, res) => {
     const provider = (process.env.PAY_PROVIDER || "").toLowerCase() || "getnet";
 
     let result;
-    if (provider === "getnet") result = await createGetnetPayment({ order });
+    if (provider === "getnet") result = await createGetnetPayment({ order, req });
     else if (provider === "mp") result = await createMpPayment({ order });
     else result = { ok: true, provider: "stub", payment_url: buildStubPaymentUrl(order.id) };
 
