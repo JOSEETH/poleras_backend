@@ -1284,11 +1284,23 @@ app.post("/pay/create", async (req, res) => {
 
     // 1️⃣2️⃣ Guardar referencia Getnet
 await pool.query(
-  `UPDATE orders
-   SET payment_ref = $1
-   WHERE id = $2`,
-  [requestId, order.id]
+  `
+  UPDATE orders
+  SET payment_ref = $1,
+      reference = $2,
+      status = 'pending_payment',
+      updated_at = now()
+  WHERE id = $3
+  `,
+  [requestId, reference, order.id]
 );
+
+console.log("🟢 [pay/create] reference guardada", {
+  order_id: order.id,
+  reference,
+  requestId
+});
+
 
     // 1️⃣3️⃣ OK → redirección
     return res.json({
