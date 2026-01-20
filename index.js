@@ -1175,11 +1175,15 @@ app.post("/pay/create", async (req, res) => {
     const buyerName = (order.buyer_name || "").trim() || "Cliente";
     const buyerPhone = (order.buyer_phone || "").trim();
 
+    // 🔹 Reference Getnet válida (máx 32 chars, sin UUID)
+const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
+
+
     // 6️⃣ Payload OFICIAL Getnet (session)
     const getnetPayload = {
       auth,
       payment: {
-        reference: String(order.id),
+        reference,
         description: `Compra Polera Huillinco (${order.id})`,
         amount: {
           currency: "CLP",
