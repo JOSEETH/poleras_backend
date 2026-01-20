@@ -1142,9 +1142,8 @@ app.post("/pay/create", async (req, res) => {
       });
     }
 
-    // 3️⃣ Calcular TOTAL REAL (FIX CLAVE)
+    // 3️⃣ Calcular TOTAL REAL (desde items)
     let total = Number(order.total_clp || 0);
-
     if (!total || total <= 0) {
       total = items.reduce((acc, it) => {
         const qty = Number(it.quantity || 0);
@@ -1152,7 +1151,6 @@ app.post("/pay/create", async (req, res) => {
         return acc + qty * price;
       }, 0);
     }
-
     if (!total || total <= 0) {
       return res.status(400).json({
         error: "order_total_invalid",
@@ -1160,59 +1158,71 @@ app.post("/pay/create", async (req, res) => {
       });
     }
 
-    // 4️⃣ Auth Getnet (helper existente)
+    // 4️⃣ Obtener IP IPv4 pública del cliente (OBLIGATORIO)
+    function getClientIPv4(req) {
+      let ip =
+        req.headers["x-forwarded-for"] ||
+        req.headers["x-real-ip"] ||
+        "";
+
+      if (Array.isArray(ip)) ip = ip[0];
+      if (typeof ip === "string") ip = ip.split(",")[0].trim();
+
+      // quitar ::ffff:
+      if (ip && ip.startsWith("::ffff:")) {
+        ip = ip.replace("::ffff:", "");
+      }
+      return ip || null;
+    }
+
+    const clientIp = getClientIPv4(req);
+    console.log("📡 IP capturada cliente:", clientIp);
+
+    if (!clientIp) {
+      return res.status(400).json({
+        error: "client_ip_missing",
+        detail: "No se pudo obtener IP pública del cliente",
+      });
+    }
+
+    // 5️⃣ userAgent (OBLIGATORIO)
+    const userAgent = String(req.headers["user-agent"] || "").trim();
+    if (!userAgent) {
+      return res.status(400).json({
+        error: "missing_user_agent",
+      });
+    }
+
+    // 6️⃣ expiration (ISO8601, +15 minutos) (OBLIGATORIO)
+    const expiration = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    // 7️⃣ reference válida (≤32 chars, sin UUID)
+    const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
+
+    // 8️⃣ Auth Getnet (helper existente)
     const auth = buildGetnetAuth();
 
     const returnUrl = process.env.GETNET_RETURN_URL;
     const cancelUrl = process.env.GETNET_CANCEL_URL || returnUrl;
-
     if (!returnUrl) {
       return res.status(500).json({ error: "missing_return_url" });
     }
 
-    // 5️⃣ Datos comprador
+    // 9️⃣ Datos comprador
     const buyerEmail = (order.buyer_email || "").trim();
     const buyerName = (order.buyer_name || "").trim() || "Cliente";
     const buyerPhone = (order.buyer_phone || "").trim();
 
-    // 🔹 Reference Getnet válida (máx 32 chars, sin UUID)
-const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
-
-// 🔹 Obtener IP IPv4 válida para Getnet
-function getClientIPv4(req) {
-  let ip =
-    (req.headers["x-forwarded-for"] || "")
-      .toString()
-      .split(",")[0]
-      .trim() ||
-    req.connection?.remoteAddress ||
-    req.socket?.remoteAddress ||
-    "";
-
-  // Eliminar prefijo IPv6 ::ffff:
-  if (ip.startsWith("::ffff:")) {
-    ip = ip.replace("::ffff:", "");
-  }
-
-  // Si sigue siendo IPv6 o inválida, fallback seguro
-  const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(\1|\d{1,3})\.(\1|\d{1,3})\.(\1|\d{1,3})$/;
-
-  if (!ipv4Regex.test(ip)) {
-    ip = "127.0.0.1";
-  }
-
-  return ip;
-}
-
-const clientIp = getClientIPv4(req);
-
-
-    // 6️⃣ Payload OFICIAL Getnet (session)
+    // 🔟 Payload OFICIAL Getnet v2.3 (CLAVE)
     const getnetPayload = {
       auth,
+      locale: "es_CL",
+      ipAddress: clientIp,          // 👈 OBLIGATORIO (en raíz)
+      userAgent,                    // 👈 OBLIGATORIO
+      expiration,                   // 👈 OBLIGATORIO
       payment: {
-        reference,
-        description: `Compra Polera Huillinco (${order.id})`,
+        reference,                  // ≤32 chars
+        description: `Compra Polera Huillinco (${reference})`,
         amount: {
           currency: "CLP",
           total: Math.round(total),
@@ -1229,14 +1239,12 @@ const clientIp = getClientIPv4(req);
         name: buyerName,
         email: buyerEmail,
         mobile: buyerPhone,
-        ipAddress: clientIp,
         address: order.delivery_address
           ? { street: String(order.delivery_address) }
           : undefined,
       },
       returnUrl,
       cancelUrl,
-      locale: "es_CL",
     };
 
     const base = process.env.GETNET_BASE_URL;
@@ -1246,7 +1254,7 @@ const clientIp = getClientIPv4(req);
 
     const url = `${base.replace(/\/$/, "")}/api/session`;
 
-    // 7️⃣ Llamada a Getnet
+    // 1️⃣1️⃣ Llamada a Getnet
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1274,7 +1282,7 @@ const clientIp = getClientIPv4(req);
       });
     }
 
-    // 8️⃣ Guardar referencia Getnet
+    // 1️⃣2️⃣ Guardar referencia Getnet
     await pool.query(
       `UPDATE orders
        SET payment_ref = $1
@@ -1282,7 +1290,7 @@ const clientIp = getClientIPv4(req);
       [requestId, order.id]
     );
 
-    // 9️⃣ OK → redirección
+    // 1️⃣3️⃣ OK → redirección
     return res.json({
       request_id: requestId,
       redirect_url: processUrl,
