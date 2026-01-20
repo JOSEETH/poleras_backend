@@ -1106,30 +1106,61 @@ function buildGetnetAuth() {
 app.post("/pay/create", async (req, res) => {
   try {
     const { order_id } = req.body;
+    if (!order_id) {
+      return res.status(400).json({ error: "missing_order_id" });
+    }
 
-    if (!order_id) return res.status(400).json({ error: "missing_order_id" });
-
-    // 1) Obtener orden + items necesarios (ajusta campos si tu tabla tiene otros nombres)
+    // 1️⃣ Obtener orden
     const oq = await pool.query(
-      `SELECT id, total_clp, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, notes, items
+      `SELECT id, total_clp, buyer_name, buyer_email, buyer_phone,
+              delivery_method, delivery_address, notes, items
        FROM orders
        WHERE id = $1`,
       [order_id]
     );
 
-    if (oq.rowCount === 0) return res.status(404).json({ error: "order_not_found" });
+    if (oq.rowCount === 0) {
+      return res.status(404).json({ error: "order_not_found" });
+    }
+
     const order = oq.rows[0];
 
-    // items puede venir como JSON string o JSON
+    // 2️⃣ Parsear items (jsonb)
     let items = [];
     try {
-      items = Array.isArray(order.items) ? order.items : JSON.parse(order.items || "[]");
+      items = Array.isArray(order.items)
+        ? order.items
+        : JSON.parse(order.items || "[]");
     } catch {
       items = [];
     }
 
-    // 2) Construir request Getnet (v2.3)
-    // OJO: evita caracteres reservados del manual en strings si puedes.
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        error: "order_items_invalid",
+        detail: "La orden no tiene items válidos",
+      });
+    }
+
+    // 3️⃣ Calcular TOTAL REAL (FIX CLAVE)
+    let total = Number(order.total_clp || 0);
+
+    if (!total || total <= 0) {
+      total = items.reduce((acc, it) => {
+        const qty = Number(it.quantity || 0);
+        const price = Number(it.unit_price_clp || it.price_clp || 0);
+        return acc + qty * price;
+      }, 0);
+    }
+
+    if (!total || total <= 0) {
+      return res.status(400).json({
+        error: "order_total_invalid",
+        detail: { total },
+      });
+    }
+
+    // 4️⃣ Auth Getnet (helper existente)
     const auth = buildGetnetAuth();
 
     const returnUrl = process.env.GETNET_RETURN_URL;
@@ -1139,24 +1170,25 @@ app.post("/pay/create", async (req, res) => {
       return res.status(500).json({ error: "missing_return_url" });
     }
 
-// Normaliza payer/buyer
+    // 5️⃣ Datos comprador
     const buyerEmail = (order.buyer_email || "").trim();
     const buyerName = (order.buyer_name || "").trim() || "Cliente";
     const buyerPhone = (order.buyer_phone || "").trim();
 
+    // 6️⃣ Payload OFICIAL Getnet (session)
     const getnetPayload = {
       auth,
       payment: {
-        reference: String(order.id),          // tu id interno como referencia
+        reference: String(order.id),
         description: `Compra Polera Huillinco (${order.id})`,
         amount: {
           currency: "CLP",
-          total: Number(order.total_clp) || 0,
+          total: Math.round(total),
         },
         allowPartial: false,
-        items: (items || []).map((it) => ({
+        items: items.map((it) => ({
           sku: String(it.sku || it.variant_id || ""),
-          name: String(it.grabado_nombre || it.name || "Producto"),
+          name: String(it.design || it.name || "Producto"),
           quantity: Number(it.quantity) || 1,
           price: Number(it.unit_price_clp || it.price_clp || 0),
         })),
@@ -1165,20 +1197,23 @@ app.post("/pay/create", async (req, res) => {
         name: buyerName,
         email: buyerEmail,
         mobile: buyerPhone,
-        address: order.delivery_address ? { street: String(order.delivery_address) } : undefined,
+        address: order.delivery_address
+          ? { street: String(order.delivery_address) }
+          : undefined,
       },
-      // URLs de retorno
       returnUrl,
       cancelUrl,
       locale: "es_CL",
     };
 
-    const base = process.env.GETNET_BASE_URL; // ej: https://checkout.test.getnet.cl  (en test)
-    if (!base) return res.status(500).json({ error: "missing_getnet_base_url" });
+    const base = process.env.GETNET_BASE_URL;
+    if (!base) {
+      return res.status(500).json({ error: "missing_getnet_base_url" });
+    }
 
     const url = `${base.replace(/\/$/, "")}/api/session`;
 
-    // 3) Llamada a Getnet
+    // 7️⃣ Llamada a Getnet
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1188,20 +1223,25 @@ app.post("/pay/create", async (req, res) => {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
-      console.error("Getnet error:", response.status, data);
-      return res.status(400).json({ error: "pay_create_failed", detail: data });
+      console.error("❌ Getnet error:", response.status, data);
+      return res.status(400).json({
+        error: "pay_create_failed",
+        detail: data,
+      });
     }
 
-    // 4) Guardar requestId / processUrl
-    // En el manual suele venir: { requestId, processUrl, status: { ... } }
     const requestId = data.requestId ? String(data.requestId) : null;
     const processUrl = data.processUrl || null;
 
-    if (!processUrl || !requestId) {
-      console.error("Getnet response missing fields:", data);
-      return res.status(400).json({ error: "pay_create_failed", detail: data });
+    if (!requestId || !processUrl) {
+      console.error("❌ Getnet response incompleta:", data);
+      return res.status(400).json({
+        error: "pay_create_failed",
+        detail: data,
+      });
     }
 
+    // 8️⃣ Guardar referencia Getnet
     await pool.query(
       `UPDATE orders
        SET payment_ref = $1
@@ -1209,16 +1249,17 @@ app.post("/pay/create", async (req, res) => {
       [requestId, order.id]
     );
 
+    // 9️⃣ OK → redirección
     return res.json({
       request_id: requestId,
       redirect_url: processUrl,
     });
+
   } catch (err) {
-    console.error(err);
+    console.error("❌ pay/create exception:", err);
     return res.status(500).json({ error: "internal_error" });
   }
 });
-
 
 // ========================
 // ✅ MERCADO PAGO (modo actual / stub)
