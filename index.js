@@ -359,7 +359,7 @@ app.post("/orders", async (req, res) => {
           delivery_method,
           delivery_address || null,
           JSON.stringify(items),
-          total, computedTotal,
+          total,
         ]
       );
 
@@ -855,7 +855,7 @@ async function getOrCreateOrderForPayment(client, {
         delivery_address || null,
         notes || null,
         JSON.stringify(items),
-        total, computedTotal,
+        total,
       ]
     );
   } catch (e) {
@@ -873,7 +873,7 @@ async function getOrCreateOrderForPayment(client, {
           delivery_method || null,
           delivery_address || null,
           JSON.stringify(items),
-          total, computedTotal,
+          total,
         ]
       );
     } else {
@@ -1070,7 +1070,6 @@ async function createMpPayment({ order }) {
   return { ok: true, provider: "mp", payment_url: initPoint, raw: mpRes?.body };
 }
 
-const crypto = require("crypto");
 
 // Helpers Getnet (WebCheckout v2.3 - WSSE UsernameToken)
 function b64(buf) {
@@ -1134,13 +1133,13 @@ app.post("/pay/create", async (req, res) => {
     const auth = buildGetnetAuth();
 
     const returnUrl = process.env.GETNET_RETURN_URL;
-    const cancelUrl = process.env.GETNET_CANCEL_URL;
+    const cancelUrl = process.env.GETNET_CANCEL_URL || returnUrl;
 
-    if (!returnUrl || !cancelUrl) {
-      return res.status(500).json({ error: "missing_return_or_cancel_url" });
+    if (!returnUrl) {
+      return res.status(500).json({ error: "missing_return_url" });
     }
 
-    // Normaliza payer/buyer
+// Normaliza payer/buyer
     const buyerEmail = (order.buyer_email || "").trim();
     const buyerName = (order.buyer_name || "").trim() || "Cliente";
     const buyerPhone = (order.buyer_phone || "").trim();
