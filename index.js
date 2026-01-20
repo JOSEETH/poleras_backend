@@ -200,7 +200,7 @@ app.post("/reserve", async (req, res) => {
     const out = [];
     for (const it of items) {
       const variant_id = it.variant_id;
-      const qty = Number(it.qty);
+      const qty = Number(it.qty ?? it.quantity);
 
       if (!variant_id || !Number.isInteger(qty) || qty <= 0) {
         await client.query("ROLLBACK");
@@ -359,7 +359,7 @@ app.post("/orders", async (req, res) => {
           delivery_method,
           delivery_address || null,
           JSON.stringify(items),
-          total,
+          total: computedTotal,
         ]
       );
 
@@ -855,7 +855,7 @@ async function getOrCreateOrderForPayment(client, {
         delivery_address || null,
         notes || null,
         JSON.stringify(items),
-        total,
+        total: computedTotal,
       ]
     );
   } catch (e) {
@@ -873,7 +873,7 @@ async function getOrCreateOrderForPayment(client, {
           delivery_method || null,
           delivery_address || null,
           JSON.stringify(items),
-          total,
+          total: computedTotal,
         ]
       );
     } else {
@@ -947,6 +947,18 @@ async function createGetnetPayment({ order, req }) {
     return { ok: false, provider: "getnet", error: "invalid_total" };
   }
 
+  // Getnet exige items[] con { name, price, quantity } (sin SKU/metadata extra)
+  const orderItems = Array.isArray(order.items) ? order.items : [];
+  const getnetItems = orderItems.length
+    ? orderItems.map((it) => ({
+        name: (it.name || (it.sku ? `Polera Huillinco (${it.sku})` : "Polera Huillinco")).toString(),
+        price: Number(it.unit_price_clp ?? it.unit_price ?? it.price_clp ?? it.price ?? 0),
+        quantity: Number(it.quantity ?? it.qty ?? 1),
+      }))
+    : [{ name: "Polera Huillinco", price: total, quantity: 1 }];
+
+  const computedTotal = getnetItems.reduce((s, i) => s + (Number(i.price) || 0) * (Number(i.quantity) || 0), 0);
+
   const returnUrl = process.env.GETNET_RETURN_URL || process.env.GETNET_RETURN || process.env.RETURN_URL;
   if (!returnUrl) {
     return {
@@ -978,8 +990,10 @@ async function createGetnetPayment({ order, req }) {
       description: `Compra Polera Huillinco (orden ${order.id})`,
       amount: {
         currency: "CLP",
-        total,
+        total: computedTotal,
       },
+      items: getnetItems,
+
     },
     expiration,
     ipAddress,
