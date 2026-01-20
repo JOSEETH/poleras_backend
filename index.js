@@ -1178,6 +1178,14 @@ app.post("/pay/create", async (req, res) => {
     // 🔹 Reference Getnet válida (máx 32 chars, sin UUID)
 const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
 
+// 🔹 Obtener IP real del cliente
+const clientIp =
+  (req.headers["x-forwarded-for"] || "")
+    .toString()
+    .split(",")[0]
+    .trim() ||
+  req.socket?.remoteAddress ||
+  "127.0.0.1";
 
     // 6️⃣ Payload OFICIAL Getnet (session)
     const getnetPayload = {
@@ -1201,6 +1209,7 @@ const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
         name: buyerName,
         email: buyerEmail,
         mobile: buyerPhone,
+        ipAddress: clientIp,
         address: order.delivery_address
           ? { street: String(order.delivery_address) }
           : undefined,
