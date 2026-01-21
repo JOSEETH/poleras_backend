@@ -1284,23 +1284,11 @@ app.post("/pay/create", async (req, res) => {
 
     // 1️⃣2️⃣ Guardar referencia Getnet
 await pool.query(
-  `
-  UPDATE orders
-  SET payment_ref = $1,
-      reference = $2,
-      status = 'pending_payment',
-      updated_at = now()
-  WHERE id = $3
-  `,
-  [requestId, reference, order.id]
+  `UPDATE orders
+   SET payment_ref = $1
+   WHERE id = $2`,
+  [requestId, order.id]
 );
-
-console.log("🟢 [pay/create] reference guardada", {
-  order_id: order.id,
-  reference,
-  requestId
-});
-
 
     // 1️⃣3️⃣ OK → redirección
     return res.json({
@@ -1375,154 +1363,132 @@ app.post("/mp/webhook", async (req, res) => {
 // Usa esta URL en el formulario de validación.
 // Ej: https://poleras-backend.onrender.com/webhooks/getnet
 // ===============================
+// ===============================
+// Getnet Web Checkout - URL de notificación (WEBHOOK)
+// Usa esta URL en el formulario de validación / producción.
+// Ej: https://poleras-backend.onrender.com/webhooks/getnet
+// ===============================
 app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
-  // Getnet puede enviar JSON u otros formatos. Nosotros aceptamos y respondemos 200 rápido.
   const payload = req.body || {};
 
-  // Intenta extraer un identificador de orden desde distintos campos posibles.
-  const maybeOrderId =
-    payload.order_id ||
-    payload.orderId ||
-    payload.buyOrder ||
-    payload.buy_order ||
-    payload.reference ||
-    payload.external_reference ||
-    payload.externalReference ||
-    (payload.data && (payload.data.order_id || payload.data.orderId || payload.data.buyOrder)) ||
-    null;
+  // ✅ Log mínimo para confirmar HIT (sin exponer secretos)
+  const safeLog = {
+    has_reference: Boolean(payload.reference || payload?.payment?.reference || payload?.data?.reference),
+    has_status: Boolean(payload.status || payload?.status?.status || payload?.notifyData?.status?.status),
+    requestId: payload.requestId || payload?.requestId?.toString?.() || payload?.data?.requestId || null,
+  };
+  console.log("🟣 [getnet webhook] HIT", safeLog);
 
-  // Siempre responde 200 para que Getnet no reintente sin fin.
+  // Responder 200 rápido (Getnet reintenta si no recibe 200)
   res.status(200).json({ ok: true });
 
-  // Si no viene order_id, dejamos log y salimos.
-  if (!maybeOrderId) {
-    console.log("[getnet webhook] payload received (no order id)");
+  // ----------------------------
+  // 1) Extraer campos clave
+  // ----------------------------
+  const reference =
+    payload.reference ||
+    payload?.payment?.reference ||
+    payload?.data?.reference ||
+    payload?.notifyData?.reference ||
+    null;
+
+  // status puede venir como string o como objeto {status:'APPROVED', ...}
+  const statusRaw =
+    payload?.status?.status ||
+    payload?.status ||
+    payload?.notifyData?.status?.status ||
+    payload?.data?.status?.status ||
+    payload?.data?.status ||
+    null;
+
+  const status = (statusRaw ? String(statusRaw) : "").toUpperCase().trim();
+
+  const requestId =
+    payload.requestId ||
+    payload?.data?.requestId ||
+    payload?.notifyData?.requestId ||
+    payload?.payment_ref ||
+    payload?.paymentRef ||
+    null;
+
+  if (!reference) {
+    console.log("🟡 [getnet webhook] sin reference, payload keys:", Object.keys(payload || {}));
     return;
   }
 
-  // Procesa en segundo plano (no bloquea el response)
+  // ----------------------------
+  // 2) Validar estado aprobado
+  // ----------------------------
+  if (status !== "APPROVED") {
+    console.log("🟡 [getnet webhook] status no APPROVED, no hago nada:", { reference, status });
+    return;
+  }
+
+  // ----------------------------
+  // 3) Marcar orden como pagada (idempotente)
+  //    OJO: Por ahora NO tocamos stock aquí.
+  // ----------------------------
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     const oq = await client.query(
-      `SELECT id, reservation_id, status, buyer_name, buyer_email, buyer_phone, delivery_method, delivery_address, items, total_clp
+      `SELECT id, status, paid_at, reference, payment_ref
          FROM orders
-        WHERE id = $1
+        WHERE reference = $1
         FOR UPDATE`,
-      [maybeOrderId]
+      [reference]
     );
 
     if (!oq.rowCount) {
       await client.query("ROLLBACK");
-      console.log("[getnet webhook] order not found:", maybeOrderId);
+      console.log("🔴 [getnet webhook] order no encontrada por reference:", reference);
       return;
     }
 
     const order = oq.rows[0];
 
-    // Idempotencia
+    // Idempotencia: si ya está paid, no hacemos nada
     if (order.status === "paid") {
       await client.query("COMMIT");
+      console.log("🟢 [getnet webhook] ya estaba paid (idempotente):", { order_id: order.id, reference });
       return;
     }
 
+    // Sólo aceptamos transición desde pending_payment (si quieres, después ampliamos)
     if (order.status !== "pending_payment") {
       await client.query("ROLLBACK");
-      console.log("[getnet webhook] order not pending_payment:", order.id, order.status);
+      console.log("🟡 [getnet webhook] order no está pending_payment:", { order_id: order.id, status: order.status, reference });
       return;
     }
 
-    if (!order.reservation_id) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] missing reservation_id in order:", order.id);
-      return;
-    }
-
-    const rq = await client.query(
-      `SELECT id, variant_id, quantity, status, expires_at
-         FROM stock_reservations
-        WHERE id = $1
-        FOR UPDATE`,
-      [order.reservation_id]
-    );
-
-    if (!rq.rowCount) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] reservation not found:", order.reservation_id);
-      return;
-    }
-
-    const r = rq.rows[0];
-    if (r.status !== "active") {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] reservation not active:", r.id, r.status);
-      return;
-    }
-
-    if (r.expires_at && new Date(r.expires_at) <= new Date()) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] reservation expired:", r.id);
-      return;
-    }
-
-    const qty = Number(r.quantity);
-    if (!Number.isInteger(qty) || qty <= 0) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] invalid quantity:", r.id, r.quantity);
-      return;
-    }
-
-    const pv = await client.query(
-      `SELECT id, stock_total, stock_reserved
-         FROM product_variants
-        WHERE id = $1
-        FOR UPDATE`,
-      [r.variant_id]
-    );
-
-    if (!pv.rowCount) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] variant not found:", r.variant_id);
-      return;
-    }
-
-    const row = pv.rows[0];
-    if (Number(row.stock_reserved) < qty || Number(row.stock_total) < qty) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] stock insufficient:", r.variant_id, { row, qty });
-      return;
-    }
-
+    // Guardar paid + (opcional) requestId si venía
     await client.query(
-      `UPDATE product_variants
-          SET stock_total = stock_total - $1,
-              stock_reserved = stock_reserved - $1
-        WHERE id = $2`,
-      [qty, r.variant_id]
-    );
-
-    await client.query(
-      `UPDATE stock_reservations
-          SET status = 'consumed'
-        WHERE id = $1`,
-      [r.id]
-    );
-
-    await client.query(
-      `UPDATE orders
-          SET status = 'paid',
-              paid_at = NOW()
-        WHERE id = $1`,
-      [order.id]
+      `
+      UPDATE orders
+         SET status = 'paid',
+             paid_at = NOW(),
+             payment_ref = COALESCE(payment_ref, $2),
+             updated_at = NOW()
+       WHERE id = $1
+      `,
+      [order.id, requestId ? String(requestId) : null]
     );
 
     await client.query("COMMIT");
+
+    console.log("✅ [getnet webhook] orden marcada como PAID:", {
+      order_id: order.id,
+      reference,
+      requestId: requestId ? String(requestId) : null,
+    });
+
+    // (Opcional futuro) aquí después haremos: consumir reserva + descontar stock definitivamente
   } catch (e) {
     try {
       await client.query("ROLLBACK");
     } catch (_) {}
-    console.error("[getnet webhook] error:", e);
+    console.error("❌ [getnet webhook] error:", e);
   } finally {
     client.release();
   }
