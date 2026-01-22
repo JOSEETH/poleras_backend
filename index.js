@@ -1317,15 +1317,15 @@ app.post("/pay/create", async (req, res) => {
     }
 
     // 1️⃣2️⃣ Guardar referencia Getnet (requestId) y reference (HUIL-xxxx)
-// Nota: reference es la que Getnet reenvía en el webhook; la guardamos para poder encontrar la orden.
-await pool.query(
-  `UPDATE orders
-      SET payment_ref = $1,
-          reference   = COALESCE(reference, $2),
-          updated_at  = NOW()
-    WHERE id = $3`,
-  [String(requestId), reference, order.id]
-);
+    // Nota: reference es la que Getnet reenvía en el webhook; la guardamos para poder encontrar la orden.
+    await pool.query(
+      `UPDATE orders
+          SET payment_ref = $1,
+              reference   = COALESCE(reference, $2),
+              updated_at  = NOW()
+        WHERE id = $3`,
+      [String(requestId), reference, order.id]
+    );
 
     // 1️⃣3️⃣ OK → redirección
     return res.json({
@@ -1413,10 +1413,15 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
     payload.buy_order ||
     null;
 
+  // ✅ FIX: status puede venir como string o como objeto { status, reason, message }
   const statusRaw =
-    payload.status ||
-    (payload.data && payload.data.status) ||
-    (payload.notifyData && payload.notifyData.status && payload.notifyData.status.status) ||
+    (payload.status && typeof payload.status === "object" ? payload.status.status : payload.status) ||
+    (payload.data && payload.data.status && typeof payload.data.status === "object"
+      ? payload.data.status.status
+      : (payload.data && payload.data.status)) ||
+    (payload.notifyData && payload.notifyData.status && typeof payload.notifyData.status === "object"
+      ? payload.notifyData.status.status
+      : (payload.notifyData && payload.notifyData.status)) ||
     null;
 
   const status = String(statusRaw || "").toUpperCase();
