@@ -70,6 +70,32 @@ function requireAdmin(req, res, next) {
   }
 }
 
+function normalizeDeliveryMethod(v) {
+  if (!v) return null;
+  const s = String(v).toLowerCase().trim();
+
+  // Retiro en tienda / pickup
+  if (["retiro", "pickup", "pick_up", "retira", "retirar", "retiro_en_tienda"].includes(s)) {
+    return "retiro";
+  }
+
+  // Envío (por pagar / despacho)
+  if ([
+    "envio_por_pagar",
+    "envio",
+    "despacho",
+    "shipping",
+    "delivery",
+    "envio por pagar",
+    "envío",
+    "envío por pagar",
+  ].includes(s)) {
+    return "envio_por_pagar";
+  }
+
+  return null;
+}
+
 // ===============================
 // ✅ HEALTH
 // ===============================
@@ -300,11 +326,13 @@ app.post("/orders", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_items" });
     }
 
-    if (!delivery_method || !["retiro", "envio_por_pagar"].includes(delivery_method)) {
+    const normalized_delivery_method = normalizeDeliveryMethod(delivery_method);
+
+    if (!normalized_delivery_method) {
       return res.status(400).json({ ok: false, error: "invalid_delivery_method" });
     }
 
-    if (delivery_method === "envio_por_pagar" && !delivery_address) {
+    if (normalized_delivery_method === "envio_por_pagar" && !delivery_address) {
       return res.status(400).json({ ok: false, error: "missing_delivery_address" });
     }
 
@@ -362,7 +390,7 @@ app.post("/orders", async (req, res) => {
           buyer_name,
           buyer_email,
           buyer_phone,
-          delivery_method,
+          normalized_delivery_method,
           delivery_address || null,
           JSON.stringify(items),
           total,
