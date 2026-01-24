@@ -535,6 +535,98 @@ app.post("/admin/test-email", requireAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, error: "send_failed" });
   }
 });
+// ===============================
+// ✅ ADMIN: REPROCESS ORDER EMAILS (por reference)
+// - Útil si una compra se pagó pero no se dispararon emails por un bug/timeout.
+// - Respeta anti-duplicado (email_*_sent_at).
+// Body: { "reference": "HUIL-XXXX" }
+// ===============================
+app.post("/admin/reprocess-order", requireAdmin, async (req, res) => {
+  try {
+    const { reference } = req.body || {};
+    if (!reference) return res.status(400).json({ ok: false, error: "missing_reference" });
+
+    const q = await pool.query(
+      `SELECT id, status, paid_at, email_customer_sent_at, email_store_sent_at
+         FROM orders
+        WHERE reference = $1`,
+      [reference]
+    );
+
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "order_not_found" });
+
+    const order = q.rows[0];
+
+    if (order.status !== "paid") {
+      return res.status(409).json({
+        ok: false,
+        error: "order_not_paid",
+        status: order.status,
+        paid_at: order.paid_at,
+      });
+    }
+
+    const r = await sendEmailsForOrderId(order.id);
+    return res.json({ ok: true, order_id: order.id, result: r });
+  } catch (e) {
+    console.error("[admin/reprocess-order] error:", e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
+});
+// ===============================
+// ✅ ADMIN: FORCE PAID + SEND EMAILS (por reference)
+// ⚠️ Úsalo SOLO si verificaste en Getnet que la transacción está APPROVED.
+// Body: { "reference": "HUIL-XXXX", "requestId": "12345" }
+// ===============================
+app.post("/admin/force-paid", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { reference, requestId } = req.body || {};
+    if (!reference) return res.status(400).json({ ok: false, error: "missing_reference" });
+
+    await client.query("BEGIN");
+
+    const oq = await client.query(
+      `SELECT id, status
+         FROM orders
+        WHERE reference = $1
+        FOR UPDATE`,
+      [reference]
+    );
+
+    if (!oq.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "order_not_found" });
+    }
+
+    const order = oq.rows[0];
+
+    if (order.status !== "paid") {
+      await client.query(
+        `UPDATE orders
+            SET status = 'paid',
+                paid_at = COALESCE(paid_at, NOW()),
+                payment_ref = COALESCE(payment_ref, $2),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [order.id, requestId ? String(requestId) : null]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    const r = await sendEmailsForOrderId(order.id);
+    return res.json({ ok: true, order_id: order.id, result: r });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("[admin/force-paid] error:", e);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  } finally {
+    client.release();
+  }
+});
+
+
 
 // ✅ ADMIN: LISTAR VARIANTES
 // ===============================
@@ -1528,20 +1620,58 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
   const payload = req.body || {};
   res.status(200).json({ ok: true });
 
-  // Getnet normalmente envía "reference" (ej: HUIL-XXXX) y un "status".
-  const reference =
-    payload.reference ||
-    (payload.data && payload.data.reference) ||
-    payload.buyOrder ||
-    payload.buy_order ||
-    null;
+  // Getnet suele enviar "reference" y "status" en distintos paths según versión.
+  function extractGetnetReference(p) {
+    const candidates = [
+      p?.reference,
+      p?.data?.reference,
+      p?.notifyData?.reference,
+      p?.payment?.reference,
+      p?.data?.payment?.reference,
+      p?.buyOrder,
+      p?.buy_order,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) return c.trim();
+    }
+    return null;
+  }
 
-  const statusRaw =
-    payload.status ||
-    (payload.data && payload.data.status) ||
-    (payload.notifyData && payload.notifyData.status && payload.notifyData.status.status) ||
-    null;
+  function extractGetnetStatus(p) {
+    const candidates = [
+      p?.notifyData?.status?.status,
+      p?.notifyData?.status,
+      p?.data?.notifyData?.status?.status,
+      p?.data?.notifyData?.status,
 
+      p?.status?.status,
+      p?.status,
+      p?.data?.status?.status,
+      p?.data?.status,
+
+      p?.payment?.status?.status,
+      p?.payment?.status,
+      p?.data?.payment?.status?.status,
+      p?.data?.payment?.status,
+    ];
+
+    for (const c of candidates) {
+      if (!c) continue;
+
+      if (typeof c === "string") return c;
+
+      if (typeof c === "object") {
+        if (typeof c.status === "string") return c.status;
+        if (c.status && typeof c.status === "object" && typeof c.status.status === "string") {
+          return c.status.status;
+        }
+      }
+    }
+    return null;
+  }
+
+  const reference = extractGetnetReference(payload);
+  const statusRaw = extractGetnetStatus(payload);
   const status = String(statusRaw || "").toUpperCase();
 
   const requestId =
@@ -1556,9 +1686,13 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
     return;
   }
 
-  // Solo confirmamos pago si viene APPROVED.
-  if (status && status !== "APPROVED") {
-    console.log("[getnet webhook] ignored (status not approved):", { reference, status });
+  // Solo confirmamos pago si viene APPROVED (si no, ignoramos).
+  if (status !== "APPROVED") {
+    console.log("[getnet webhook] ignored (status not approved):", {
+      reference,
+      status,
+      statusRawType: typeof statusRaw,
+    });
     return;
   }
 
