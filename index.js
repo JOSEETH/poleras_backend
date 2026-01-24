@@ -586,8 +586,9 @@ app.post("/admin/force-paid", requireAdmin, async (req, res) => {
 
     await client.query("BEGIN");
 
+    // 1) Lock order
     const oq = await client.query(
-      `SELECT id, status
+      `SELECT id, status, reservation_id, items
          FROM orders
         WHERE reference = $1
         FOR UPDATE`,
@@ -601,6 +602,141 @@ app.post("/admin/force-paid", requireAdmin, async (req, res) => {
 
     const order = oq.rows[0];
 
+    // 1.1) Idempotency: if we already registered an online-sale movement for this order, skip stock changes
+    const alreadyApplied = await client.query(
+      `SELECT 1
+         FROM stock_movements
+        WHERE movement_type = 'sale_online'
+          AND note LIKE $1
+        LIMIT 1`,
+      [`order:${order.id}%`]
+    );
+
+    if (!alreadyApplied.rowCount) {
+      // 2) Apply stock effects based on reservation + items
+      let items = [];
+      try {
+        items = Array.isArray(order.items) ? order.items : JSON.parse(order.items || "[]");
+      } catch (_) {
+        items = [];
+      }
+
+      const r = items && items[0] ? items[0] : null;
+      const qty = r ? Number(r.quantity || 0) : 0;
+      const variantId = r ? r.variant_id : null;
+
+      let unitPrice = null;
+      if (r) {
+        unitPrice = Number(r.unit_price_clp ?? r.unit_price ?? r.price_clp ?? null);
+        if (!Number.isFinite(unitPrice)) unitPrice = null;
+      }
+
+      if (variantId && Number.isFinite(qty) && qty > 0) {
+        if (order.reservation_id) {
+          // Lock reservation row if exists
+          const rq = await client.query(
+            `SELECT id, status, variant_id, quantity
+               FROM stock_reservations
+              WHERE id = $1
+              FOR UPDATE`,
+            [order.reservation_id]
+          );
+
+          if (rq.rowCount) {
+            const resv = rq.rows[0];
+            const rqty = Number(resv.quantity || qty) || qty;
+
+            if (resv.status === "active") {
+              // Consume reservation: reserved stock -> sold stock
+              await client.query(
+                `UPDATE stock_reservations
+                    SET status = 'consumed',
+                        consumed_at = NOW()
+                  WHERE id = $1`,
+                [resv.id]
+              );
+
+              // Decrease both total and reserved
+              await client.query(
+                `UPDATE product_variants
+                    SET stock_total = stock_total - $1,
+                        stock_reserved = GREATEST(stock_reserved - $1, 0)
+                  WHERE id = $2`,
+                [rqty, resv.variant_id]
+              );
+
+              await client.query(
+                `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
+                 VALUES ($1, 'sale_online', $2, $3, $4)`,
+                [resv.variant_id, rqty, unitPrice, `order:${order.id} ref:${reference} (force_paid)`]
+              );
+            } else if (resv.status === "expired") {
+              // Reservation expired: try to discount from total (manual review if insufficient)
+              const pvq = await client.query(
+                `SELECT stock_total FROM product_variants WHERE id = $1 FOR UPDATE`,
+                [resv.variant_id]
+              );
+              if (pvq.rowCount) {
+                const st = Number(pvq.rows[0].stock_total);
+                if (Number.isFinite(st) && st >= rqty) {
+                  await client.query(
+                    `UPDATE product_variants
+                        SET stock_total = stock_total - $1
+                      WHERE id = $2`,
+                    [rqty, resv.variant_id]
+                  );
+                  await client.query(
+                    `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
+                     VALUES ($1, 'sale_online', $2, $3, $4)`,
+                    [resv.variant_id, rqty, unitPrice, `order:${order.id} ref:${reference} (force_paid_expired_reservation)`]
+                  );
+                } else {
+                  console.log("[admin/force-paid] NOT enough stock_total after reservation expired. Manual review needed.", {
+                    variant_id: resv.variant_id,
+                    stock_total: st,
+                    qty: rqty,
+                    reference,
+                  });
+                }
+              }
+            } else {
+              // consumed/cancelled: do nothing (movement likely already exists or stock was handled elsewhere)
+            }
+          }
+        } else {
+          // No reservation_id stored: discount stock_total directly (best-effort)
+          const pvq = await client.query(
+            `SELECT stock_total FROM product_variants WHERE id = $1 FOR UPDATE`,
+            [variantId]
+          );
+          if (pvq.rowCount) {
+            const st = Number(pvq.rows[0].stock_total);
+            if (Number.isFinite(st) && st >= qty) {
+              await client.query(
+                `UPDATE product_variants
+                    SET stock_total = stock_total - $1
+                  WHERE id = $2`,
+                [qty, variantId]
+              );
+              await client.query(
+                `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
+                 VALUES ($1, 'sale_online', $2, $3, $4)`,
+                [variantId, qty, unitPrice, `order:${order.id} ref:${reference} (force_paid_no_reservation)`]
+              );
+            } else {
+              console.log("[admin/force-paid] NOT enough stock_total (no reservation). Manual review needed.", {
+                variant_id: variantId,
+                stock_total: st,
+                qty,
+                reference,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // 3) Mark paid
     if (order.status !== "paid") {
       await client.query(
         `UPDATE orders
@@ -615,6 +751,7 @@ app.post("/admin/force-paid", requireAdmin, async (req, res) => {
 
     await client.query("COMMIT");
 
+    // 4) Send emails (idempotent by *_sent_at)
     const r = await sendEmailsForOrderId(order.id);
     return res.json({ ok: true, order_id: order.id, result: r });
   } catch (e) {
@@ -625,7 +762,6 @@ app.post("/admin/force-paid", requireAdmin, async (req, res) => {
     client.release();
   }
 });
-
 
 
 // ✅ ADMIN: LISTAR VARIANTES
