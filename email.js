@@ -22,13 +22,13 @@ function renderItemsTable(items = []) {
       const qty = Number(it.quantity || 0);
       const price = fmtCLP(it.price_clp);
       return `
-        <tr>
-          <td style="padding:8px;border:1px solid #e5e7eb">${sku}</td>
-          <td style="padding:8px;border:1px solid #e5e7eb">${variant}</td>
-          <td style="padding:8px;border:1px solid #e5e7eb">${qty}</td>
-          <td style="padding:8px;border:1px solid #e5e7eb">$${price}</td>
-        </tr>
-      `;
+      <tr>
+        <td style="padding:8px;border:1px solid #e5e7eb">${sku}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb">${variant}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb">${qty}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb">$${price}</td>
+      </tr>
+    `;
     })
     .join("");
 
@@ -92,64 +92,79 @@ async function sendMail({ to, subject, html, text }) {
   return { ok: true };
 }
 
-/**
- * ✅ CORREO CLIENTE (simple + WhatsApp)
- * Debe decir: "Pronto te contactaremos para coordinar tu envío o retiro"
- * y botón "Hablar por Whatsapp" a +56966592507
- */
+function buildWhatsAppButton() {
+  const waNumber = env("WHATSAPP_NUMBER", "56966592507");
+  const label = env("WHATSAPP_LABEL", "Hablar por Whatsapp");
+
+  // wa.me solo acepta dígitos
+  const digits = String(waNumber).replace(/\D/g, "");
+  const url = `https://wa.me/${digits}`;
+
+  return `
+    <div style="margin:16px 0 6px">
+      <a href="${url}"
+         style="display:inline-block;padding:12px 16px;border-radius:10px;
+                background:#16a34a;color:#ffffff;text-decoration:none;
+                font-weight:700">
+        ${safeText(label)}
+      </a>
+    </div>
+    <div style="font-size:12px;color:#6b7280">
+      O escríbenos a WhatsApp: +${digits}
+    </div>
+  `;
+}
+
 async function sendCustomerConfirmationEmail(order) {
   const ref = safeText(order.reference || "");
+  const total = fmtCLP(order.total_clp);
   const items = Array.isArray(order.items) ? order.items : [];
 
-  const buyerName = safeText(order.buyer_name || "");
-  const buyerEmail = order.buyer_email || order.to;
-  if (!buyerEmail) throw new Error("Missing customer email (buyer_email).");
-
-  const whatsapp = "56966592507";
-  const waText = `Hola! Hice una compra de Poleras Huillinco. Mi referencia es ${ref}.`;
-  const waLink = `https://wa.me/${whatsapp}?text=${encodeURIComponent(waText)}`;
+  const deliveryMethod = safeText(order.delivery_method || "-");
+  const deliveryAddress = order.delivery_address
+    ? safeText(order.delivery_address)
+    : null;
 
   const html = `
-    <div style="font-family:system-ui,Arial;line-height:1.4;max-width:720px;margin:0 auto">
-      <h2 style="margin:0 0 10px">✅ Compra confirmada</h2>
+    <div style="font-family:system-ui,Arial;line-height:1.4">
+      <h2 style="margin:0 0 8px">✅ Compra confirmada — Poleras Huillinco</h2>
+      <p style="margin:0 0 10px">Hola ${safeText(
+        order.buyer_name || ""
+      )}, tu pago fue confirmado.</p>
 
-      <p style="margin:0 0 10px">Hola ${buyerName},</p>
+      <p style="margin:0 0 6px"><b>Referencia:</b> ${ref}</p>
+      <p style="margin:0 0 6px"><b>Método de entrega:</b> ${deliveryMethod}</p>
+      ${
+        deliveryAddress
+          ? `<p style="margin:0 0 10px"><b>Dirección:</b> ${deliveryAddress}</p>`
+          : `<div style="height:8px"></div>`
+      }
 
-      <p style="margin:0 0 14px">
-        Tu pago fue aprobado correctamente.
+      <div style="margin:12px 0">${renderItemsTable(items)}</div>
+
+      <p style="margin:10px 0"><b>Total:</b> $${total} CLP</p>
+
+      <p style="margin:12px 0 0">
+        <b>Importante:</b> pronto te contactaremos para coordinar tu envío o retiro.
       </p>
 
-      <p style="margin:0 0 14px">
-        <b>Pronto te contactaremos para coordinar tu envío o retiro.</b>
+      ${buildWhatsAppButton()}
+
+      <p style="margin:14px 0 0;color:#6b7280;font-size:12px">
+        Si necesitas ayuda, responde a este correo.
       </p>
-
-      <div style="margin:14px 0">
-        ${renderItemsTable(items)}
-      </div>
-
-      <p style="margin:12px 0 16px">
-        <b>Referencia:</b> ${ref}
-      </p>
-
-      <a href="${waLink}"
-         style="display:inline-block;padding:12px 16px;background:#16a34a;color:white;text-decoration:none;border-radius:10px;font-weight:600">
-        Hablar por Whatsapp
-      </a>
-
-      <p style="margin:16px 0 0;color:#6b7280;font-size:13px">
-        Si el botón no funciona, copia este enlace en tu navegador:<br/>
-        ${waLink}
-      </p>
-
-      <p style="margin:16px 0 0">— Cervecería Huillinco</p>
+      <p style="margin:10px 0 0">— Cervecería Huillinco</p>
     </div>
   `;
 
+  const to = order.to || order.buyer_email;
+  if (!to) throw new Error("Missing customer email (buyer_email).");
+
   return sendMail({
-    to: buyerEmail,
+    to,
     subject: `✅ Compra confirmada — ${ref}`,
     html,
-    text: `Compra confirmada. Ref: ${ref}. Pronto te contactaremos para coordinar tu envío o retiro. WhatsApp: https://wa.me/${whatsapp}`,
+    text: `Compra confirmada. Ref: ${ref}. Total: $${total} CLP. Pronto te contactaremos para coordinar tu envío o retiro. WhatsApp: +56966592507`,
   });
 }
 
