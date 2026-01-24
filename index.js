@@ -15,7 +15,6 @@ const crypto = require("crypto");
 
 const mercadopago = require("mercadopago");
 
-const { sendStoreNotificationEmail } = require("./email");
 
 const app = express();
 app.use(cors());
@@ -101,6 +100,85 @@ function normalizeDeliveryMethod(v) {
 // ===============================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// ===============================
+// ✅ EMAIL HELPERS (Zoho SMTP)
+// ===============================
+const { sendCustomerConfirmationEmail, sendStoreNotificationEmail } = require("./email");
+
+async function sendEmailsForOrderId(orderId) {
+  const client = await pool.connect();
+  try {
+    const oq = await client.query(
+      `SELECT id, reference, status, paid_at,
+              buyer_name, buyer_email, buyer_phone,
+              delivery_method, delivery_address,
+              items, total_clp,
+              email_customer_sent_at, email_store_sent_at
+         FROM orders
+        WHERE id = $1`,
+      [orderId]
+    );
+
+    if (!oq.rowCount) return { ok: false, error: "order_not_found" };
+    const order = oq.rows[0];
+
+    // Solo mandamos si está pagada
+    if (order.status !== "paid") return { ok: false, error: "order_not_paid" };
+
+    const items = Array.isArray(order.items) ? order.items : (() => {
+      try { return JSON.parse(order.items || "[]"); } catch { return []; }
+    })();
+
+    const storeEmail = process.env.STORE_NOTIFY_EMAIL;
+
+    // 1) Email al cliente
+    if (!order.email_customer_sent_at && order.buyer_email) {
+      await sendCustomerConfirmationEmail({
+        to: order.buyer_email,
+        reference: order.reference,
+        buyer_name: order.buyer_name,
+        buyer_email: order.buyer_email,
+        buyer_phone: order.buyer_phone,
+        delivery_method: order.delivery_method,
+        delivery_address: order.delivery_address,
+        items,
+        total_clp: order.total_clp,
+      });
+
+      await client.query(
+        `UPDATE orders SET email_customer_sent_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [order.id]
+      );
+    }
+
+    // 2) Email a la tienda
+    if (!order.email_store_sent_at && storeEmail) {
+      await sendStoreNotificationEmail({
+        to: storeEmail,
+        reference: order.reference,
+        buyer_name: order.buyer_name,
+        buyer_email: order.buyer_email,
+        buyer_phone: order.buyer_phone,
+        delivery_method: order.delivery_method,
+        delivery_address: order.delivery_address,
+        items,
+        total_clp: order.total_clp,
+      });
+
+      await client.query(
+        `UPDATE orders SET email_store_sent_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [order.id]
+      );
+    }
+
+    return { ok: true };
+  } catch (e) {
+    console.error("[email] error:", e);
+    return { ok: false, error: "email_failed" };
+  } finally {
+    client.release();
+  }
+}
 // ===============================
 // ✅ ADMIN LOGIN
 // ===============================
@@ -413,6 +491,33 @@ app.post("/orders", async (req, res) => {
 });
 
 // ===============================
+// ===============================
+// ✅ ADMIN: TEST EMAIL (debug)
+// ===============================
+app.post("/admin/test-email", requireAdmin, async (req, res) => {
+  try {
+    const { to } = req.body || {};
+    const dest = to || process.env.STORE_NOTIFY_EMAIL || process.env.SMTP_USER;
+    if (!dest) return res.status(400).json({ ok: false, error: "missing_to" });
+
+    await sendStoreNotificationEmail({
+      to: dest,
+      reference: "TEST-" + Date.now(),
+      buyer_name: "Cliente Test",
+      buyer_email: "cliente@test.com",
+      buyer_phone: "+56 9 0000 0000",
+      delivery_method: "retiro",
+      delivery_address: null,
+      items: [{ sku: "HUIL-TEST", color: "Negra", size: "L", design: "En el Techo", quantity: 1, price_clp: 14990 }],
+      total_clp: 14990,
+    });
+
+    return res.json({ ok: true, sent_to: dest });
+  } catch (e) {
+    console.error("[admin/test-email] error:", e);
+    return res.status(500).json({ ok: false, error: "send_failed" });
+  }
+});
 // ✅ ADMIN: LISTAR VARIANTES
 // ===============================
 app.get("/admin/variants", requireAdmin, async (req, res) => {
@@ -593,7 +698,7 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
       [id, newTotal]
     );
 
-    const movementQty = q; // ✅ siempre positivo (DB tiene check constraint quantity > 0)
+    const movementQty = movement_type === "adjust_in" ? q : -q;
 
     await client.query(
       `
@@ -662,9 +767,7 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
         pv.grabado_nombre,
         sm.movement_type,
         sm.quantity AS qty,
-        sm.quantity AS quantity,
         sm.unit_price_clp AS price_clp,
-        sm.unit_price_clp AS unit_price_clp,
         sm.note
       FROM stock_movements sm
       LEFT JOIN product_variants pv ON pv.id = sm.variant_id
@@ -1511,6 +1614,8 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
         [order.id, requestId ? String(requestId) : null]
       );
       await client.query("COMMIT");
+      // Enviar emails (si no fueron enviados antes)
+      try { await sendEmailsForOrderId(order.id); } catch (e) { console.error('[getnet webhook] email error:', e); }
       return;
     }
 
@@ -1549,7 +1654,7 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
           await client.query(
             `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
              VALUES ($1, 'sale_online', $2, NULL, $3)`,
-            [r.variant_id, -qty, `order:${order.id} ref:${reference} (expired_reservation)`]
+            [r.variant_id, qty, `order:${order.id} ref:${reference} (expired_reservation)`]
           );
         } else {
           console.log("[getnet webhook] NOT enough stock_total after reservation expired. Manual review needed.", { variant_id: r.variant_id, stock_total: st, qty });
@@ -1567,6 +1672,8 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
       );
 
       await client.query("COMMIT");
+      // Enviar emails (si no fueron enviados antes)
+      try { await sendEmailsForOrderId(order.id); } catch (e) { console.error('[getnet webhook] email error:', e); }
       return;
     }
 
@@ -1628,7 +1735,7 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
     await client.query(
       `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
        VALUES ($1, 'sale_online', $2, $3, $4)`,
-      [r.variant_id, -qty, unitPrice, `order:${order.id} ref:${reference}`]
+      [r.variant_id, qty, unitPrice, `order:${order.id} ref:${reference}`]
     );
 
     // 4) Marcar orden pagada + guardar requestId si vino
@@ -1643,6 +1750,8 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
     );
 
     await client.query("COMMIT");
+    // Enviar emails (si no fueron enviados antes)
+    try { await sendEmailsForOrderId(order.id); } catch (e) { console.error('[getnet webhook] email error:', e); }
   } catch (e) {
     try {
       await client.query("ROLLBACK");
