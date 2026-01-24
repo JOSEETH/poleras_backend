@@ -1,4 +1,4 @@
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
 function env(name, fallback = null) {
   const v = process.env[name];
@@ -45,47 +45,48 @@ function renderItemsTable(items = []) {
   `;
 }
 
-// Reutiliza conexión (evita crear transporter por request)
-let _transporter = null;
+let _resend = null;
 
-function getTransporter() {
-  if (_transporter) return _transporter;
+function getResend() {
+  if (_resend) return _resend;
 
-  const host = env("SMTP_HOST", "smtp.zoho.com");
-  const port = Number(env("SMTP_PORT", 587));
-  const secure = String(env("SMTP_SECURE", "false")) === "true"; // con 587 debe ser false
-  const user = env("SMTP_USER");
-  const pass = env("SMTP_PASS");
-
-  if (!host || !user || !pass) {
-    throw new Error("Missing SMTP env vars (SMTP_HOST/SMTP_USER/SMTP_PASS).");
+  const apiKey = env("RESEND_API_KEY");
+  if (!apiKey) {
+    throw new Error("Missing RESEND_API_KEY env var.");
   }
 
-  // FIX: STARTTLS por 587 (soluciona ETIMEDOUT en Render con 465)
-  _transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,              // false en 587
-    requireTLS: true,    // fuerza STARTTLS
-    auth: { user, pass },
+  _resend = new Resend(apiKey);
+  return _resend;
+}
 
-    // timeouts para Render / cold starts
-    connectionTimeout: Number(env("SMTP_CONNECTION_TIMEOUT_MS", 20000)),
-    greetingTimeout: Number(env("SMTP_GREETING_TIMEOUT_MS", 20000)),
-    socketTimeout: Number(env("SMTP_SOCKET_TIMEOUT_MS", 20000)),
-
-    // útil para diagnósticos (si quieres)
-    logger: String(env("SMTP_LOGGER", "false")) === "true",
-    debug: String(env("SMTP_DEBUG", "false")) === "true",
-  });
-
-  return _transporter;
+/**
+ * Resend requiere "from" tipo: "Nombre <correo@dominio>"
+ * IMPORTANTE:
+ * - Si tu dominio (cerveceriahuillinco.cl) está verificado en Resend, puedes usar contacto@...
+ * - Si NO está verificado, Resend te obligará a usar un remitente de su dominio (te dará el error).
+ */
+function getFrom() {
+  return env("FROM_EMAIL") || "Poleras Cervecería Huillinco <contacto@cerveceriahuillinco.cl>";
 }
 
 async function sendMail({ to, subject, html, text }) {
-  const transporter = getTransporter();
-  const from = env("FROM_EMAIL", env("SMTP_USER"));
-  return transporter.sendMail({ from, to, subject, html, text });
+  const resend = getResend();
+  const from = getFrom();
+
+  const { error } = await resend.emails.send({
+    from,
+    to: Array.isArray(to) ? to : [to],
+    subject,
+    html,
+    text,
+  });
+
+  if (error) {
+    // deja el error real en logs
+    throw new Error(`Resend send failed: ${error.message || JSON.stringify(error)}`);
+  }
+
+  return { ok: true };
 }
 
 async function sendCustomerConfirmationEmail(order) {
@@ -113,7 +114,6 @@ async function sendCustomerConfirmationEmail(order) {
     </div>
   `;
 
-  // FIX: usar buyer_email si no viene order.to
   const to = order.to || order.buyer_email;
   if (!to) throw new Error("Missing customer email (buyer_email).");
 
@@ -157,7 +157,6 @@ async function sendStoreNotificationEmail(order) {
     </div>
   `;
 
-  // FIX: usar STORE_NOTIFY_EMAIL si no viene order.to
   const to = order.to || env("STORE_NOTIFY_EMAIL");
   if (!to) throw new Error("Missing store email (STORE_NOTIFY_EMAIL).");
 
