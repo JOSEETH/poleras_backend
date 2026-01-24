@@ -944,7 +944,7 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
       [id, newTotal]
     );
 
-    const movementQty = movement_type === "adjust_in" ? q : -q;
+    const movementQty = q; // ✅ DB constraint expects positive quantities
 
     await client.query(
       `
