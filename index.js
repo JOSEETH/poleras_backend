@@ -44,36 +44,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-
-// ===============================
-// ✅ STOCK_MOVEMENTS TIME COLUMN (compat)
-// - Algunos esquemas usan occurred_at, otros created_at.
-// - Detectamos una vez y cacheamos para evitar 500 en /admin/sales-summary y /admin/stock-movements.
-// ===============================
-let STOCK_MOVEMENTS_TIME_COL = null;
-
-async function getStockMovementsTimeCol(client) {
-  if (STOCK_MOVEMENTS_TIME_COL) return STOCK_MOVEMENTS_TIME_COL;
-  const cols = await client.query(
-    `SELECT column_name
-       FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = 'stock_movements'`
-  );
-  const names = new Set(cols.rows.map(r => r.column_name));
-  if (names.has('occurred_at')) STOCK_MOVEMENTS_TIME_COL = 'occurred_at';
-  else if (names.has('created_at')) STOCK_MOVEMENTS_TIME_COL = 'created_at';
-  else if (names.has('createdat')) STOCK_MOVEMENTS_TIME_COL = 'createdat';
-  else STOCK_MOVEMENTS_TIME_COL = null;
-  return STOCK_MOVEMENTS_TIME_COL;
-}
-
-function movementsDateExpr(col) {
-  // col puede ser null si la tabla no tiene timestamp (muy raro). En ese caso no filtramos por fecha.
-  if (!col) return null;
-  return `(sm.${col} AT TIME ZONE 'America/Santiago')::date`;
-}
-
 // ===============================
 // ✅ HELPERS
 // ===============================
@@ -204,7 +174,7 @@ async function cleanupExpiredReservations() {
       `
       SELECT id, variant_id, quantity
       FROM stock_reservations
-      WHERE status IN ('active','pending_payment') AND expires_at <= NOW()
+      WHERE status = 'active' AND expires_at <= NOW()
       FOR UPDATE;
       `
     );
@@ -628,11 +598,11 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
     await client.query(
       `
       INSERT INTO stock_movements
-        (variant_id, sku, movement_type, qty, price_clp, note)
+        (variant_id, movement_type, quantity, unit_price_clp, note)
       VALUES
-        ($1, $2, $3, $4, $5, $6)
+        ($1, $2, $3, $4, $5)
       `,
-      [id, row.sku, movement_type, movementQty, price, note || null]
+      [id, movement_type, movementQty, price, note || null]
     );
 
     await client.query("COMMIT");
@@ -662,47 +632,49 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const timeCol = await getStockMovementsTimeCol(client);
-    const dateExpr = movementsDateExpr(timeCol);
-
     const params = [];
     const where = [];
 
-    // Siempre filtramos por movement_type? no, en detalle queremos todos.
-    if (from && dateExpr) {
+    if (from) {
       params.push(from);
-      where.push(`${dateExpr} >= $${params.length}::date`);
+      where.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${params.length}::date`
+      );
     }
-    if (to && dateExpr) {
+
+    if (to) {
       params.push(to);
-      where.push(`${dateExpr} <= $${params.length}::date`);
+      where.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${params.length}::date`
+      );
     }
 
     const sql =
       `
       SELECT
         sm.id,
-        ${timeCol ? `sm.${timeCol} AS occurred_at,` : `NULL::timestamptz AS occurred_at,`}
+        sm.occurred_at,
         sm.variant_id,
-        sm.sku,
+        pv.sku AS sku,
         pv.color,
         pv.size,
         pv.grabado_codigo,
         pv.grabado_nombre,
         sm.movement_type,
-        sm.qty,
-        sm.price_clp,
+        sm.quantity AS qty,
+        sm.unit_price_clp AS price_clp,
         sm.note
       FROM stock_movements sm
       LEFT JOIN product_variants pv ON pv.id = sm.variant_id
       ` +
       (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
       `
-      ORDER BY ${timeCol ? `sm.${timeCol}` : "sm.id"} DESC
+      ORDER BY sm.occurred_at DESC
       LIMIT 2000;
       `;
 
     const q = await client.query(sql, params);
+
     return res.json({ ok: true, movements: q.rows });
   } catch (e) {
     console.error("GET /admin/stock-movements error:", e);
@@ -712,7 +684,6 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
   }
 });
 
-
 // ===============================
 // ✅ ADMIN: SALES SUMMARY (KPIs)
 // ===============================
@@ -721,36 +692,34 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const timeCol = await getStockMovementsTimeCol(client);
-    const dateExpr = movementsDateExpr(timeCol);
-
     const params = [];
-    const where = [`sm.movement_type = 'sale_offline'`];
+    const where = [`sm.movement_type IN ('sale_offline','sale_online')`];
 
-    if (from && dateExpr) {
+    if (from) {
       params.push(from);
-      where.push(`${dateExpr} >= $${params.length}::date`);
+      where.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date >= $${params.length}::date`
+      );
     }
 
-    if (to && dateExpr) {
+    if (to) {
       params.push(to);
-      where.push(`${dateExpr} <= $${params.length}::date`);
+      where.push(
+        `(sm.occurred_at AT TIME ZONE 'America/Santiago')::date <= $${params.length}::date`
+      );
     }
 
     const sql =
       `
       SELECT
-        COALESCE(SUM(ABS(sm.qty)), 0)::int AS units_sold,
-        COALESCE(SUM(ABS(sm.qty) * COALESCE(sm.price_clp, 0)), 0)::bigint AS total_clp
+        COALESCE(SUM(ABS(sm.quantity)), 0)::int AS units_sold,
+        COALESCE(SUM(ABS(sm.quantity) * COALESCE(sm.unit_price_clp, 0)), 0)::bigint AS total_clp
       FROM stock_movements sm
       ` +
       (where.length ? ` WHERE ${where.join(" AND ")}` : "");
 
     const q = await client.query(sql, params);
-
-    // Para compat con el admin panel: devolvemos ambos formatos
-    const summary = q.rows[0] || { units_sold: 0, total_clp: 0 };
-    return res.json({ ok: true, ...summary, summary });
+    return res.json({ ok: true, summary: q.rows[0] });
   } catch (e) {
     console.error("GET /admin/sales-summary error:", e);
     return res.status(500).json({ ok: false, error: "sales_summary_failed" });
@@ -758,7 +727,6 @@ app.get("/admin/sales-summary", requireAdmin, async (req, res) => {
     client.release();
   }
 });
-
 
 
 // ========================
@@ -859,7 +827,7 @@ async function getOrCreateOrderForPayment(client, {
   if (!rq.rowCount) return null;
   const r = rq.rows[0];
 
-  if (!['active','pending_payment'].includes(r.status)) {
+  if (r.status !== "active") {
     throw Object.assign(new Error("reservation_not_active"), { http: 409, code: "reservation_not_active", status: r.status });
   }
   if (r.expires_at && new Date(r.expires_at) <= new Date()) {
@@ -1176,9 +1144,9 @@ app.post("/pay/create", async (req, res) => {
       return res.status(400).json({ error: "missing_order_id" });
     }
 
-    // 1️⃣ Obtener orden (incluye reservation_id para proteger reserva antes de pagar)
+    // 1️⃣ Obtener orden
     const oq = await pool.query(
-      `SELECT id, reservation_id, total_clp, buyer_name, buyer_email, buyer_phone,
+      `SELECT id, total_clp, buyer_name, buyer_email, buyer_phone,
               delivery_method, delivery_address, notes, items
        FROM orders
        WHERE id = $1`,
@@ -1224,7 +1192,7 @@ app.post("/pay/create", async (req, res) => {
       });
     }
 
-    // 4️⃣ IP IPv4 pública del cliente (OBLIGATORIO)
+    // 4️⃣ Obtener IP IPv4 pública del cliente (OBLIGATORIO)
     function getClientIPv4(req) {
       let ip =
         req.headers["x-forwarded-for"] ||
@@ -1234,6 +1202,7 @@ app.post("/pay/create", async (req, res) => {
       if (Array.isArray(ip)) ip = ip[0];
       if (typeof ip === "string") ip = ip.split(",")[0].trim();
 
+      // quitar ::ffff:
       if (ip && ip.startsWith("::ffff:")) {
         ip = ip.replace("::ffff:", "");
       }
@@ -1258,67 +1227,13 @@ app.post("/pay/create", async (req, res) => {
       });
     }
 
-    // 6️⃣ expiration (ISO8601) + TTL
-    const ttlMin = Number(process.env.GETNET_SESSION_TTL_MINUTES || 15);
-    const expiration = new Date(Date.now() + ttlMin * 60 * 1000).toISOString();
+    // 6️⃣ expiration (ISO8601, +15 minutos) (OBLIGATORIO)
+    const expiration = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-    // 7️⃣ reference (≤32 chars) - estable por orden
-    const reference = `HUIL-${String(order.id).slice(0, 8).toUpperCase()}`;
+    // 7️⃣ reference válida (≤32 chars, sin UUID)
+    const reference = `HUIL-${order.id.slice(0, 8).toUpperCase()}`;
 
-    // ✅ SAFE: proteger la reserva ANTES de enviar a pagar:
-    // - Evita que el cleanup la marque expired mientras el cliente paga.
-    // - Extiende expires_at para cubrir la ventana del pago.
-    if (order.reservation_id) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-
-        const rq = await client.query(
-          `SELECT id, status, expires_at
-             FROM stock_reservations
-            WHERE id = $1
-            FOR UPDATE`,
-          [order.reservation_id]
-        );
-
-        if (!rq.rowCount) {
-          await client.query("ROLLBACK");
-          return res.status(409).json({ error: "reservation_not_found_for_order" });
-        }
-
-        const r = rq.rows[0];
-
-        // Si ya está consumida, no tiene sentido volver a pagar
-        if (r.status === "consumed") {
-          await client.query("ROLLBACK");
-          return res.status(409).json({ error: "reservation_already_consumed" });
-        }
-
-        const newExp = new Date(Date.now() + ttlMin * 60 * 1000);
-
-        // Pasamos a pending_payment y extendemos expiración si hace falta
-        await client.query(
-          `UPDATE stock_reservations
-              SET status = CASE
-                            WHEN status = 'active' THEN 'pending_payment'
-                            ELSE status
-                          END,
-                  expires_at = GREATEST(expires_at, $2)
-            WHERE id = $1`,
-          [order.reservation_id, newExp.toISOString()]
-        );
-
-        await client.query("COMMIT");
-      } catch (e) {
-        try { await client.query("ROLLBACK"); } catch (_) {}
-        console.error("❌ pay/create safe reservation lock error:", e);
-        // No rompemos el pago por esto, pero te va a ayudar a diagnosticar
-      } finally {
-        client.release();
-      }
-    }
-
-    // 8️⃣ Auth Getnet
+    // 8️⃣ Auth Getnet (helper existente)
     const auth = buildGetnetAuth();
 
     const returnUrl = process.env.GETNET_RETURN_URL;
@@ -1332,15 +1247,15 @@ app.post("/pay/create", async (req, res) => {
     const buyerName = (order.buyer_name || "").trim() || "Cliente";
     const buyerPhone = (order.buyer_phone || "").trim();
 
-    // 🔟 Payload Getnet v2.3
+    // 🔟 Payload OFICIAL Getnet v2.3 (CLAVE)
     const getnetPayload = {
       auth,
       locale: "es_CL",
-      ipAddress: clientIp,
-      userAgent,
-      expiration,
+      ipAddress: clientIp,          // 👈 OBLIGATORIO (en raíz)
+      userAgent,                    // 👈 OBLIGATORIO
+      expiration,                   // 👈 OBLIGATORIO
       payment: {
-        reference,
+        reference,                  // ≤32 chars
         description: `Compra Polera Huillinco (${reference})`,
         amount: {
           currency: "CLP",
@@ -1401,15 +1316,16 @@ app.post("/pay/create", async (req, res) => {
       });
     }
 
-    // 1️⃣2️⃣ Guardar requestId + reference (para webhook)
-    await pool.query(
-      `UPDATE orders
-          SET payment_ref = $1,
-              reference   = COALESCE(reference, $2),
-              updated_at  = NOW()
-        WHERE id = $3`,
-      [String(requestId), reference, order.id]
-    );
+    // 1️⃣2️⃣ Guardar referencia Getnet (requestId) y reference (HUIL-xxxx)
+// Nota: reference es la que Getnet reenvía en el webhook; la guardamos para poder encontrar la orden.
+await pool.query(
+  `UPDATE orders
+      SET payment_ref = $1,
+          reference   = COALESCE(reference, $2),
+          updated_at  = NOW()
+    WHERE id = $3`,
+  [String(requestId), reference, order.id]
+);
 
     // 1️⃣3️⃣ OK → redirección
     return res.json({
@@ -1422,7 +1338,6 @@ app.post("/pay/create", async (req, res) => {
     return res.status(500).json({ error: "internal_error" });
   }
 });
-
 
 // ========================
 // ✅ MERCADO PAGO (modo actual / stub)
@@ -1532,8 +1447,7 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
 
     // 1) Buscar la orden por reference (NO por id)
     const oq = await client.query(
-      `SELECT id, reservation_id, status
-         FROM orders
+      `SELECT id, reservation_id, status, items, total_clp FROM orders
         WHERE reference = $1
         FOR UPDATE`,
       [reference]
@@ -1584,7 +1498,7 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
     const r = rq.rows[0];
 
     // Si ya está consumida, igual dejamos la orden como paid (idempotencia)
-    if (!['active','pending_payment'].includes(r.status)) {
+    if (r.status !== "active") {
       await client.query(
         `UPDATE orders
             SET status = 'paid',
@@ -1598,9 +1512,59 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
       return;
     }
 
+    // Si la reserva expiró, NO abortamos el pago.
+    // - Marcamos la orden como pagada (para no "perder" el pago)
+    // - Intentamos descontar stock_total si hay stock suficiente (sin tocar reserved, porque ya pudo liberarse)
     if (r.expires_at && new Date(r.expires_at) <= new Date()) {
-      await client.query("ROLLBACK");
-      console.log("[getnet webhook] reservation expired:", r.id);
+      console.log("[getnet webhook] reservation expired, proceeding best-effort:", r.id);
+
+      const qty = Number(r.quantity);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        await client.query("ROLLBACK");
+        console.log("[getnet webhook] invalid reservation qty:", r.id, r.quantity);
+        return;
+      }
+
+      const pv2 = await client.query(
+        `SELECT id, stock_total
+           FROM product_variants
+          WHERE id = $1
+          FOR UPDATE`,
+        [r.variant_id]
+      );
+
+      if (pv2.rowCount) {
+        const st = Number(pv2.rows[0].stock_total);
+        if (Number.isFinite(st) && st >= qty) {
+          await client.query(
+            `UPDATE product_variants
+                SET stock_total = stock_total - $1
+              WHERE id = $2`,
+            [qty, r.variant_id]
+          );
+
+          // Registrar movimiento online igualmente
+          await client.query(
+            `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
+             VALUES ($1, 'sale_online', $2, NULL, $3)`,
+            [r.variant_id, -qty, `order:${order.id} ref:${reference} (expired_reservation)`]
+          );
+        } else {
+          console.log("[getnet webhook] NOT enough stock_total after reservation expired. Manual review needed.", { variant_id: r.variant_id, stock_total: st, qty });
+        }
+      }
+
+      await client.query(
+        `UPDATE orders
+            SET status = 'paid',
+                paid_at = NOW(),
+                payment_ref = COALESCE(payment_ref, $2),
+                updated_at = NOW()
+          WHERE id = $1`,
+        [order.id, requestId ? String(requestId) : null]
+      );
+
+      await client.query("COMMIT");
       return;
     }
 
@@ -1646,6 +1610,23 @@ app.post(["/webhooks/getnet", "/getnet/webhook"], async (req, res) => {
           SET status = 'consumed'
         WHERE id = $1`,
       [r.id]
+    );
+
+
+    // 3.5) Registrar movimiento para reportes (venta online)
+    let unitPrice = null;
+    try {
+      const items = Array.isArray(order.items) ? order.items : JSON.parse(order.items || "[]");
+      unitPrice = items && items[0] ? Number(items[0].unit_price_clp ?? items[0].unit_price ?? items[0].price_clp ?? null) : null;
+      if (!Number.isFinite(unitPrice)) unitPrice = null;
+    } catch (_) {
+      unitPrice = null;
+    }
+
+    await client.query(
+      `INSERT INTO stock_movements (variant_id, movement_type, quantity, unit_price_clp, note)
+       VALUES ($1, 'sale_online', $2, $3, $4)`,
+      [r.variant_id, -qty, unitPrice, `order:${order.id} ref:${reference}`]
     );
 
     // 4) Marcar orden pagada + guardar requestId si vino
