@@ -593,7 +593,7 @@ app.post("/admin/variants/:id/move", requireAdmin, async (req, res) => {
       [id, newTotal]
     );
 
-    const movementQty = movement_type === "adjust_in" ? q : -q;
+    const movementQty = q; // ✅ siempre positivo (DB tiene check constraint quantity > 0)
 
     await client.query(
       `
@@ -662,7 +662,9 @@ app.get("/admin/stock-movements", requireAdmin, async (req, res) => {
         pv.grabado_nombre,
         sm.movement_type,
         sm.quantity AS qty,
+        sm.quantity AS quantity,
         sm.unit_price_clp AS price_clp,
+        sm.unit_price_clp AS unit_price_clp,
         sm.note
       FROM stock_movements sm
       LEFT JOIN product_variants pv ON pv.id = sm.variant_id
