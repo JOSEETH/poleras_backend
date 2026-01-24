@@ -45,10 +45,15 @@ function renderItemsTable(items = []) {
   `;
 }
 
+// Reutiliza conexión (evita crear transporter por request)
+let _transporter = null;
+
 function getTransporter() {
-  const host = env("SMTP_HOST");
-  const port = Number(env("SMTP_PORT", 465));
-  const secure = String(env("SMTP_SECURE", "true")) === "true";
+  if (_transporter) return _transporter;
+
+  const host = env("SMTP_HOST", "smtp.zoho.com");
+  const port = Number(env("SMTP_PORT", 587));
+  const secure = String(env("SMTP_SECURE", "false")) === "true"; // con 587 debe ser false
   const user = env("SMTP_USER");
   const pass = env("SMTP_PASS");
 
@@ -56,12 +61,25 @@ function getTransporter() {
     throw new Error("Missing SMTP env vars (SMTP_HOST/SMTP_USER/SMTP_PASS).");
   }
 
-  return nodemailer.createTransport({
+  // FIX: STARTTLS por 587 (soluciona ETIMEDOUT en Render con 465)
+  _transporter = nodemailer.createTransport({
     host,
     port,
-    secure,
+    secure,              // false en 587
+    requireTLS: true,    // fuerza STARTTLS
     auth: { user, pass },
+
+    // timeouts para Render / cold starts
+    connectionTimeout: Number(env("SMTP_CONNECTION_TIMEOUT_MS", 20000)),
+    greetingTimeout: Number(env("SMTP_GREETING_TIMEOUT_MS", 20000)),
+    socketTimeout: Number(env("SMTP_SOCKET_TIMEOUT_MS", 20000)),
+
+    // útil para diagnósticos (si quieres)
+    logger: String(env("SMTP_LOGGER", "false")) === "true",
+    debug: String(env("SMTP_DEBUG", "false")) === "true",
   });
+
+  return _transporter;
 }
 
 async function sendMail({ to, subject, html, text }) {
@@ -95,8 +113,12 @@ async function sendCustomerConfirmationEmail(order) {
     </div>
   `;
 
+  // FIX: usar buyer_email si no viene order.to
+  const to = order.to || order.buyer_email;
+  if (!to) throw new Error("Missing customer email (buyer_email).");
+
   return sendMail({
-    to: order.to,
+    to,
     subject: `✅ Compra confirmada — ${ref}`,
     html,
     text: `Compra confirmada. Ref: ${ref}. Total: $${total} CLP.`,
@@ -135,8 +157,12 @@ async function sendStoreNotificationEmail(order) {
     </div>
   `;
 
+  // FIX: usar STORE_NOTIFY_EMAIL si no viene order.to
+  const to = order.to || env("STORE_NOTIFY_EMAIL");
+  if (!to) throw new Error("Missing store email (STORE_NOTIFY_EMAIL).");
+
   return sendMail({
-    to: order.to,
+    to,
     subject: `🛒 Nueva venta confirmada — ${ref}`,
     html,
     text: `Nueva venta confirmada. Ref: ${ref}. Total: $${total} CLP.`,
