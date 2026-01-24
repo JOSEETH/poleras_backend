@@ -496,28 +496,46 @@ app.post("/orders", async (req, res) => {
 // ===============================
 app.post("/admin/test-email", requireAdmin, async (req, res) => {
   try {
-    const { to } = req.body || {};
+    const { to, type } = req.body || {}; // type: "store" | "customer"
     const dest = to || process.env.STORE_NOTIFY_EMAIL || process.env.SMTP_USER;
     if (!dest) return res.status(400).json({ ok: false, error: "missing_to" });
 
-    await sendStoreNotificationEmail({
+    const reference = "TEST-" + Date.now();
+
+    const payload = {
       to: dest,
-      reference: "TEST-" + Date.now(),
+      reference,
       buyer_name: "Cliente Test",
-      buyer_email: "cliente@test.com",
+      buyer_email: dest, // IMPORTANTE: para que el correo de cliente llegue a tu inbox
       buyer_phone: "+56 9 0000 0000",
       delivery_method: "retiro",
       delivery_address: null,
-      items: [{ sku: "HUIL-TEST", color: "Negra", size: "L", design: "En el Techo", quantity: 1, price_clp: 14990 }],
+      items: [
+        {
+          sku: "HUIL-TEST",
+          color: "Negra",
+          size: "L",
+          design: "En el Techo",
+          quantity: 1,
+          price_clp: 14990,
+        },
+      ],
       total_clp: 14990,
-    });
+    };
 
-    return res.json({ ok: true, sent_to: dest });
+    if (type === "customer") {
+      await sendCustomerConfirmationEmail(payload);
+    } else {
+      await sendStoreNotificationEmail(payload);
+    }
+
+    return res.json({ ok: true, sent_to: dest, type: type || "store", reference });
   } catch (e) {
     console.error("[admin/test-email] error:", e);
     return res.status(500).json({ ok: false, error: "send_failed" });
   }
 });
+
 // ✅ ADMIN: LISTAR VARIANTES
 // ===============================
 app.get("/admin/variants", requireAdmin, async (req, res) => {

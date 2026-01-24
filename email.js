@@ -22,13 +22,13 @@ function renderItemsTable(items = []) {
       const qty = Number(it.quantity || 0);
       const price = fmtCLP(it.price_clp);
       return `
-      <tr>
-        <td style="padding:8px;border:1px solid #e5e7eb">${sku}</td>
-        <td style="padding:8px;border:1px solid #e5e7eb">${variant}</td>
-        <td style="padding:8px;border:1px solid #e5e7eb">${qty}</td>
-        <td style="padding:8px;border:1px solid #e5e7eb">$${price}</td>
-      </tr>
-    `;
+        <tr>
+          <td style="padding:8px;border:1px solid #e5e7eb">${sku}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb">${variant}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb">${qty}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb">$${price}</td>
+        </tr>
+      `;
     })
     .join("");
 
@@ -53,9 +53,7 @@ function getResend() {
   if (_resend) return _resend;
 
   const apiKey = env("RESEND_API_KEY");
-  if (!apiKey) {
-    throw new Error("Missing RESEND_API_KEY env var.");
-  }
+  if (!apiKey) throw new Error("Missing RESEND_API_KEY env var.");
 
   _resend = new Resend(apiKey);
   return _resend;
@@ -63,6 +61,7 @@ function getResend() {
 
 /**
  * Resend requiere "from" tipo: "Nombre <correo@dominio>"
+ * Tu dominio cerveceriahuillinco.cl ya está verificado, así que esto está OK.
  */
 function getFrom() {
   return (
@@ -92,68 +91,63 @@ async function sendMail({ to, subject, html, text }) {
   return { ok: true };
 }
 
-function buildWhatsAppButton() {
-  const waNumber = env("WHATSAPP_NUMBER", "56966592507");
-  const label = env("WHATSAPP_LABEL", "Hablar por Whatsapp");
-
-  // wa.me solo acepta dígitos
-  const digits = String(waNumber).replace(/\D/g, "");
-  const url = `https://wa.me/${digits}`;
-
-  return `
-    <div style="margin:16px 0 6px">
-      <a href="${url}"
-         style="display:inline-block;padding:12px 16px;border-radius:10px;
-                background:#16a34a;color:#ffffff;text-decoration:none;
-                font-weight:700">
-        ${safeText(label)}
-      </a>
-    </div>
-    <div style="font-size:12px;color:#6b7280">
-      O escríbenos a WhatsApp: +${digits}
-    </div>
-  `;
+function buildWhatsAppLink({ reference, deliveryMethod }) {
+  const phone = "56966592507";
+  const msg = `Hola! Soy ${reference || "cliente"} 🙂. Mi compra fue confirmada. Quiero coordinar ${deliveryMethod || "envío o retiro"}.`;
+  const url = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+  return { phone, url };
 }
 
 async function sendCustomerConfirmationEmail(order) {
   const ref = safeText(order.reference || "");
-  const total = fmtCLP(order.total_clp);
-  const items = Array.isArray(order.items) ? order.items : [];
+  const buyerName = safeText(order.buyer_name || "");
+  const deliveryMethodRaw = safeText(order.delivery_method || "");
+  const deliveryMethod =
+    deliveryMethodRaw.toLowerCase() === "retiro"
+      ? "retiro"
+      : deliveryMethodRaw.toLowerCase() === "envio" || deliveryMethodRaw.toLowerCase() === "envío"
+      ? "envío"
+      : deliveryMethodRaw || "envío o retiro";
 
-  const deliveryMethod = safeText(order.delivery_method || "-");
-  const deliveryAddress = order.delivery_address
-    ? safeText(order.delivery_address)
-    : null;
+  const { phone, url } = buildWhatsAppLink({
+    reference: ref ? `ref ${ref}` : "cliente",
+    deliveryMethod,
+  });
 
   const html = `
-    <div style="font-family:system-ui,Arial;line-height:1.4">
+    <div style="font-family:system-ui,Arial;line-height:1.4;max-width:720px">
       <h2 style="margin:0 0 8px">✅ Compra confirmada — Poleras Huillinco</h2>
-      <p style="margin:0 0 10px">Hola ${safeText(
-        order.buyer_name || ""
-      )}, tu pago fue confirmado.</p>
+      <p style="margin:0 0 10px">Hola ${buyerName || "👋"}, tu pago fue confirmado.</p>
 
-      <p style="margin:0 0 6px"><b>Referencia:</b> ${ref}</p>
-      <p style="margin:0 0 6px"><b>Método de entrega:</b> ${deliveryMethod}</p>
-      ${
-        deliveryAddress
-          ? `<p style="margin:0 0 10px"><b>Dirección:</b> ${deliveryAddress}</p>`
-          : `<div style="height:8px"></div>`
-      }
+      ${ref ? `<p style="margin:0 0 12px"><b>Referencia:</b> ${ref}</p>` : ""}
 
-      <div style="margin:12px 0">${renderItemsTable(items)}</div>
-
-      <p style="margin:10px 0"><b>Total:</b> $${total} CLP</p>
-
-      <p style="margin:12px 0 0">
-        <b>Importante:</b> pronto te contactaremos para coordinar tu envío o retiro.
+      <p style="margin:0 0 14px">
+        <b>Pronto te contactaremos</b> para coordinar tu <b>${deliveryMethod}</b>.
       </p>
 
-      ${buildWhatsAppButton()}
+      <a
+        href="${url}"
+        style="
+          display:inline-block;
+          background:#25D366;
+          color:#ffffff !important;
+          text-decoration:none;
+          padding:12px 16px;
+          border-radius:10px;
+          font-weight:700;
+          margin:6px 0 10px;
+        "
+      >Hablar por Whatsapp</a>
 
-      <p style="margin:14px 0 0;color:#6b7280;font-size:12px">
-        Si necesitas ayuda, responde a este correo.
+      <p style="margin:0 0 8px;color:#374151;font-size:13px">
+        Si el botón no aparece, abre este enlace: <br/>
+        <a href="${url}" style="color:#2563eb">${safeText(url)}</a>
       </p>
-      <p style="margin:10px 0 0">— Cervecería Huillinco</p>
+
+      <p style="margin:14px 0 0;color:#374151">
+        — Cervecería Huillinco<br/>
+        WhatsApp: +${phone}
+      </p>
     </div>
   `;
 
@@ -162,9 +156,9 @@ async function sendCustomerConfirmationEmail(order) {
 
   return sendMail({
     to,
-    subject: `✅ Compra confirmada — ${ref}`,
+    subject: ref ? `✅ Compra confirmada — ${ref}` : `✅ Compra confirmada — Poleras Huillinco`,
     html,
-    text: `Compra confirmada. Ref: ${ref}. Total: $${total} CLP. Pronto te contactaremos para coordinar tu envío o retiro. WhatsApp: +56966592507`,
+    text: `Compra confirmada${ref ? ` (Ref: ${ref})` : ""}. Pronto te contactaremos para coordinar tu ${deliveryMethod}. WhatsApp: +${phone} ${url}`,
   });
 }
 
@@ -193,15 +187,9 @@ async function sendStoreNotificationEmail(order) {
       <h2 style="margin:0 0 8px">🛒 Nueva venta confirmada</h2>
 
       <p style="margin:0 0 6px"><b>Referencia:</b> ${ref}</p>
-      <p style="margin:0 0 6px"><b>Cliente:</b> ${safeText(
-        order.buyer_name || "-"
-      )}</p>
-      <p style="margin:0 0 6px"><b>Email:</b> ${safeText(
-        order.buyer_email || "-"
-      )}</p>
-      <p style="margin:0 0 6px"><b>Teléfono:</b> ${safeText(
-        order.buyer_phone || "-"
-      )}</p>
+      <p style="margin:0 0 6px"><b>Cliente:</b> ${safeText(order.buyer_name || "-")}</p>
+      <p style="margin:0 0 6px"><b>Email:</b> ${safeText(order.buyer_email || "-")}</p>
+      <p style="margin:0 0 6px"><b>Teléfono:</b> ${safeText(order.buyer_phone || "-")}</p>
       <p style="margin:0 0 6px"><b>Método de entrega:</b> ${deliveryMethod}</p>
       ${
         deliveryAddress
